@@ -1,0 +1,7 @@
+browser-use==0.13.1
+streamlit>=1.28.0
+python-dotenv>=1.0.0
+playwright>=1.40.0
+google-generativeai>=0.3.0
+langchain-google-genai>=2.0.0
+psutil
