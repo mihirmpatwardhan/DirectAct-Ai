@@ -1,10 +1,23 @@
 import axios from 'axios';
 import type { Session, Message, HealthResponse, ActionLog } from '../types';
 
+const TOKEN_KEY = 'directact_token';
+
 const api = axios.create({
   baseURL: '/api/v1',
   headers: { 'Content-Type': 'application/json' },
   timeout: 30000,
+});
+
+// FIX: Auto-attach JWT token to every request so authenticated endpoints work.
+// Previously the general API (sessions, chat, actions) had no token, causing
+// 401 errors for all calls after login.
+api.interceptors.request.use((config) => {
+  const token = localStorage.getItem(TOKEN_KEY);
+  if (token) {
+    config.headers.Authorization = `Bearer ${token}`;
+  }
+  return config;
 });
 
 // ---- Health ----

@@ -4,10 +4,12 @@ Health & System Routes
 import platform
 import psutil
 from datetime import datetime
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from app.core.config import settings
+from app.core.auth_utils import get_current_user
 from app.core.websocket_manager import manager
 from app.services.llm_service import llm_service
+from app.models.models import User
 
 router = APIRouter()
 
@@ -22,7 +24,7 @@ def _get_active_provider() -> str:
 
 @router.get("/health")
 async def health_check():
-    """Basic health check endpoint."""
+    """Basic health check endpoint — public, no auth required."""
     return {
         "status": "ok",
         "app": settings.app_name,
@@ -32,8 +34,12 @@ async def health_check():
 
 
 @router.get("/health/detailed")
-async def detailed_health():
-    """Detailed system health including resource usage."""
+async def detailed_health(current_user: User = Depends(get_current_user)):
+    """
+    Detailed system health including resource usage.
+    FIX: Requires authentication — system info (CPU/memory/disk/platform) should
+    not be exposed to unauthenticated callers.
+    """
     try:
         cpu_percent = psutil.cpu_percent(interval=0.1)
         mem = psutil.virtual_memory()

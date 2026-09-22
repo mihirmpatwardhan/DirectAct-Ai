@@ -1,45 +1,30 @@
-import React, { useState } from 'react';
+import React from 'react';
 import { Settings, Cpu, Zap, Brain } from 'lucide-react';
 import { useAppStore } from './store/appStore';
 import { Sidebar } from './components/Sidebar/Sidebar';
 import { ChatPanel } from './components/ChatPanel/ChatPanel';
-import { ViewportPanel } from './components/ViewportPanel/ViewportPanel';
 import { TimelinePanel } from './components/TimelinePanel/TimelinePanel';
+import { ProfileSelector } from './components/ProfileSelector/ProfileSelector';
+import { useWebSocket } from './hooks/useWebSocket';
 
 function App() {
-  const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
-  const [customChatWidth, setCustomChatWidth] = useState<number>(340);
-  const { wsStatus, llmProvider, llmReady, layoutMode } = useAppStore();
+  // Use Zustand as the single source of truth for active session —
+  // no local useState needed. Sidebar writes to Zustand, ChatPanel reads from it.
+  const activeSessionId = useAppStore((s) => s.activeSessionId);
+  const { wsStatus, llmProvider, llmReady } = useAppStore();
+  // There must be exactly one socket per dashboard/session. Both ChatPanel and
+  // TimelinePanel need to send messages, but the server intentionally keeps a
+  // single live connection per session to prevent duplicated event delivery.
+  const { sendMessage, sendApproval } = useWebSocket(activeSessionId);
 
   return (
-    <div
-      className={`app-shell mode-${layoutMode}`}
-      style={{ '--chat-width': `${customChatWidth}px` } as React.CSSProperties}
-    >
+    <div className="app-shell">
       {/* Top Bar */}
       <header className="app-topbar">
         <div className="topbar-logo">
           <div className="topbar-logo-icon">⚡</div>
           <span className="topbar-logo-name">DirectAct-AI</span>
           <span className="topbar-logo-tagline">Define. Direct. Done.</span>
-        </div>
-
-        <div className="topbar-sep" />
-
-        {/* Panel Width Adjuster Slider */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 11, color: 'var(--text-muted)' }}>
-          <span>Chat Width:</span>
-          <input
-            type="range"
-            min="240"
-            max="600"
-            step="10"
-            value={customChatWidth}
-            onChange={(e) => setCustomChatWidth(Number(e.target.value))}
-            style={{ width: 80, cursor: 'pointer', accentColor: 'var(--accent-primary)' }}
-            title={`Adjust Chat Width (${customChatWidth}px)`}
-          />
-          <span style={{ fontSize: 10, fontFamily: 'monospace' }}>{customChatWidth}px</span>
         </div>
 
         <div className="topbar-sep" />
@@ -62,6 +47,11 @@ function App() {
           </span>
         </div>
 
+        <div style={{ flex: 1 }} />
+
+        {/* Chrome Profile Selector */}
+        <ProfileSelector />
+
         <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 11, color: 'var(--text-muted)' }}>
             <Cpu size={12} />
@@ -74,16 +64,13 @@ function App() {
       </header>
 
       {/* Left: Session Sidebar */}
-      <Sidebar onSessionSelect={setActiveSessionId} />
+      <Sidebar />
 
-      {/* Center: Chat Panel */}
-      <ChatPanel sessionId={activeSessionId} />
-
-      {/* Center-Right: Live Viewport */}
-      <ViewportPanel />
+      {/* Center: Chat Panel — fills central space */}
+      <ChatPanel sessionId={activeSessionId} sendMessage={sendMessage} />
 
       {/* Right: Timeline / Execution Panel */}
-      <TimelinePanel />
+      <TimelinePanel sendApproval={sendApproval} />
     </div>
   );
 }

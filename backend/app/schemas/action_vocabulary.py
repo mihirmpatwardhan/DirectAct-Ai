@@ -58,7 +58,7 @@ class CommandType(str, enum.Enum):
     # Script execution (restricted, off by default, extra scrutiny)
     RUN_APPROVED_SCRIPT = "run_approved_script"
 
-    # Web stub (Phase 2 — engine-agnostic orchestrator accepts this now)
+    # Web navigation
     OPEN_URL = "open_url"
 
     # Pure information (no OS side-effect)
@@ -356,6 +356,8 @@ class OpenURL(BaseCommand):
     @classmethod
     def validate_url(cls, v: str) -> str:
         v = v.strip()
+        if v == "about:blank":
+            return v
         if not v.startswith(("http://", "https://")):
             v = "https://" + v
         return v

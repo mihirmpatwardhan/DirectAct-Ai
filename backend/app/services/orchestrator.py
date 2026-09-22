@@ -57,6 +57,15 @@ logger = logging.getLogger(__name__)
 malware_guard = MalwareGuard()
 
 
+def _is_interactive_desktop_task(text: str) -> bool:
+    """Whether a request needs GUI controls, without naming an app."""
+    return bool(re.search(
+        r"\b(click|double[- ]?click|type|write|enter|fill|press|select|choose|paste|save|search|check|uncheck|play|pause|resume|skip|listen|create|edit|send|reply|upload|download)\b|\b(and|then)\b",
+        text or "",
+        re.IGNORECASE,
+    ))
+
+
 class ExecutionMode(str, Enum):
     AUTONOMOUS = "autonomous"       # Auto-execute routine actions; guard still runs
     HUMAN_IN_LOOP = "hitl"         # Require approval at every step boundary
@@ -110,6 +119,22 @@ def parse_action_plan(plan_dict: dict) -> ActionPlan:
             import inspect
             valid_fields = set(inspect.signature(cls).parameters.keys())
             filtered = {k: v for k, v in step.items() if k in valid_fields}
+
+            # Auto-recover open_url steps where LLM forgot to include the url field
+            if cmd_type == CommandType.OPEN_URL and "url" not in filtered:
+                desc = step.get("description", "")
+                # Try to extract URL from description
+                import re as _re
+                url_match = _re.search(r'https?://[^\s"]+', desc)
+                if url_match:
+                    filtered["url"] = url_match.group(0)
+                else:
+                    # Keep the browser on a neutral page. The agent decides
+                    # where to go from the complete task instead of being
+                    # coupled to a particular search provider.
+                    filtered["url"] = "about:blank"
+                logger.info(f"Auto-recovered open_url: url={filtered['url']}")
+
             cmd = cls(**filtered)
             steps.append(cmd)
         except Exception as e:
@@ -145,6 +170,7 @@ class OrchestratorResult:
         parameters: dict = None,
         block_reason: str = "",
         plan: Optional[ActionPlan] = None,
+        output: str = "",
     ):
         self.action_id = action_id
         self.status = status
@@ -157,6 +183,7 @@ class OrchestratorResult:
         self.parameters = parameters or {}
         self.block_reason = block_reason
         self.plan = plan
+        self.output = output
 
     def to_dict(self) -> dict:
         return {
@@ -170,6 +197,7 @@ class OrchestratorResult:
             "requires_approval": self.requires_approval,
             "parameters": self.parameters,
             "block_reason": self.block_reason,
+            "output": self.output,
         }
 
     # Backward compat: expose decision-like interface
@@ -210,6 +238,8 @@ class ExecutionOrchestrator:
     # Pending approval requests: action_id → asyncio.Event
     _approval_events: dict[str, asyncio.Event] = {}
     _approval_decisions: dict[str, bool] = {}
+    # Keep the guarded plan so approval resumes the same compound task.
+    _pending_sagas: dict[str, tuple[ActionPlan, str, int, str]] = {}
 
     async def process(
         self,
@@ -220,11 +250,15 @@ class ExecutionOrchestrator:
         execution_mode: str = ExecutionMode.AUTONOMOUS,
     ) -> OrchestratorResult:
         """Process user input through the full pipeline."""
+        import time as _time
+        process_t0 = _time.perf_counter()
         action_id = str(uuid.uuid4())
         logger.info(f"Orchestrator: processing action={action_id[:8]} session={session_id}")
 
         # Step 1: Route
         decision = task_router.classify(user_input, target_engine=target_engine)
+        if decision.task_type == TaskType.AMBIGUOUS and target_engine not in {"web", "desktop"}:
+            decision = await task_router.classify_with_llm(user_input)
         logger.info(f"Router: type={decision.task_type.value} confidence={decision.confidence:.2f}")
 
         # Step 2: Log action
@@ -246,18 +280,63 @@ class ExecutionOrchestrator:
                 routing_method=decision.routing_method.value,
             )
 
-        # Step 4: LLM generates an ActionPlan from the user input
-        plan_dict = await llm_service.parse_action_plan_from_response(
-            await self._get_plan_from_llm(user_input, decision)
-        )
-
-        if plan_dict:
-            plan = parse_action_plan(plan_dict)
+        # Step 4: Interactive desktop work is a single guarded saga step whose
+        # executor runs the UIA agent. Keeping the raw intent on the step is
+        # important: reducing "open Notepad and type ..." to LaunchApp would
+        # silently drop everything after the launch.
+        #
+        # Step 4: Desktop automation tasks route to the UIA agent loop,
+        # passing the raw user intent directly to the LLM agent without
+        # hardcoding or loss of scope.
+        plan_t0 = _time.perf_counter()
+        if decision.task_type == TaskType.WEB or target_engine == "web":
+            return await self._execute_web_task(
+                user_input=user_input,
+                decision=decision,
+                action_id=action_id,
+                session_id=session_id,
+                db=db,
+                execution_mode=execution_mode,
+            )
+        elif decision.task_type == TaskType.DESKTOP or target_engine == "desktop":
+            app_target = decision.parameters.get("app_name") or ""
+            plan = ActionPlan(
+                task_id=action_id,
+                original_intent=user_input,
+                steps=[LaunchApp(
+                    app_id=app_target or user_input,
+                    description=f"Control desktop: {user_input}",
+                    requires_approval=decision.requires_approval,
+                )],
+            )
+            plan_elapsed = (_time.perf_counter() - plan_t0) * 1000
+            logger.info("Orchestrator: routing desktop task to agent loop with raw intent")
         else:
-            # Fall back to a simple single-step plan based on routing
-            plan = self._build_fallback_plan(user_input, decision, action_id)
+            plan_dict = await llm_service.parse_action_plan_from_response(
+                await self._get_plan_from_llm(user_input, decision)
+            )
+            plan_elapsed = (_time.perf_counter() - plan_t0) * 1000
+            logger.info(f"⏱️  LLM planning completed in {plan_elapsed:.0f}ms")
+
+            if plan_dict:
+                plan = parse_action_plan(plan_dict)
+            else:
+                plan = self._build_fallback_plan(user_input, decision, action_id)
 
         logger.info(f"Orchestrator: plan has {len(plan.steps)} step(s), highest_risk={plan.highest_risk.value}")
+
+        # Persist a JSON copy as a restart-safe recovery record. The in-memory
+        # entry is faster, while the DB record prevents approval from falling
+        # back to regex-based command reconstruction after a process restart.
+        await self._update_action(
+            db, action_id, "pending",
+            result={
+                "pending_plan": plan.model_dump(mode="json"),
+                "raw_input": user_input,
+                "next_step": 0,
+                "execution_mode": execution_mode,
+            },
+        )
 
         # Step 5: Emit task_started event
         event_emitter = lambda evt: _emit(session_id, evt)
@@ -272,7 +351,7 @@ class ExecutionOrchestrator:
         ))
 
         # Step 6: Execute saga
-        await self._execute_saga(
+        execution_status = await self._execute_saga(
             plan=plan,
             action_id=action_id,
             session_id=session_id,
@@ -280,8 +359,10 @@ class ExecutionOrchestrator:
             execution_mode=execution_mode,
             raw_input=user_input,
         )
+        total_elapsed = (_time.perf_counter() - process_t0) * 1000
+        logger.info(f"⏱️  Orchestrator pipeline total: {total_elapsed:.0f}ms (planning={plan_elapsed:.0f}ms)")
 
-        status = "dispatched"
+        status = execution_status
         return OrchestratorResult(
             action_id=action_id,
             status=status,
@@ -293,22 +374,188 @@ class ExecutionOrchestrator:
             plan=plan,
         )
 
+    async def _execute_web_task(
+        self,
+        user_input: str,
+        decision,
+        action_id: str,
+        session_id: str,
+        db: AsyncSession,
+        execution_mode: str = ExecutionMode.AUTONOMOUS,
+    ) -> OrchestratorResult:
+        """
+        Directly execute a web automation task via the agentic web_engine loop.
+        Bypasses os_engine and fallback plan machinery so complex web tasks
+        (movie ticket booking, travel planning, form filling) interact with live Chrome.
+        """
+        import time as _time
+        t0 = _time.perf_counter()
+        logger.info(f"Orchestrator: routing web task {action_id[:8]} directly to web_engine")
+
+        url = decision.parameters.get("url") or ""
+        raw_task = decision.parameters.get("raw_task") or user_input
+
+        # 1. Security inspection via MalwareGuard
+        # Do not substitute a vendor URL when the user did not provide one.
+        # The generic browser agent will choose its first navigation from the
+        # task and current page state after this neutral guard check.
+        check_cmd = OpenURL(url=url or "about:blank", description=user_input)
+        event_emitter = lambda evt: _emit(session_id, evt)
+        ctx = GuardContext(
+            action_id=action_id,
+            task_id=action_id,
+            session_id=session_id,
+            execution_mode=execution_mode,
+            raw_input=user_input,
+            event_emitter=event_emitter,
+        )
+        guard_result: PipelineResult = await malware_guard.validate(check_cmd, ctx)
+        if not guard_result.allowed:
+            await _emit(session_id, TaskFailedEvent(
+                type=EventType.TASK_FAILED,
+                session_id=session_id,
+                task_id=action_id,
+                failed_at_step=0,
+                reason=guard_result.block_reason or "Blocked by Malware Guard",
+            ))
+            await self._update_action(
+                db, action_id, "failed",
+                threat_level=guard_result.highest_risk.value,
+                error_message=guard_result.block_reason or "Blocked by Malware Guard",
+            )
+            return OrchestratorResult(
+                action_id=action_id,
+                status="blocked",
+                task_type="web",
+                intent=decision.extracted_intent,
+                confidence=decision.confidence,
+                routing_method=decision.routing_method.value,
+                threat_level=guard_result.highest_risk.value,
+                block_reason=guard_result.block_reason,
+                parameters=decision.parameters,
+                output=f"Action blocked by Malware Guard: {guard_result.block_reason}",
+            )
+
+        # 2. Emit TaskStartedEvent to Timeline
+        await _emit(session_id, TaskStartedEvent(
+            type=EventType.TASK_STARTED,
+            session_id=session_id,
+            task_id=action_id,
+            original_intent=user_input,
+            total_steps=20,
+            highest_risk=guard_result.highest_risk.value if hasattr(guard_result, "highest_risk") else "low",
+            requires_any_approval=False,
+        ))
+        await self._update_action(db, action_id, "running")
+
+        # 3. Call web_engine.run_task directly
+        from app.services.web_engine import web_engine
+        try:
+            web_result = await web_engine.run_task(
+                task_query=user_input,
+                url=url,
+                session_id=session_id,
+                task_id=action_id,
+            )
+        except Exception as e:
+            logger.error(f"Web engine execution error: {e}", exc_info=True)
+            web_result = {"success": False, "error": str(e), "steps": 0}
+
+        elapsed = (_time.perf_counter() - t0) * 1000
+        success = bool(web_result.get("success", False))
+        steps = web_result.get("steps", 1)
+        output = web_result.get("output", "")
+        error_msg = web_result.get("error", "")
+
+        if success:
+            await _emit(session_id, TaskCompletedEvent(
+                type=EventType.TASK_COMPLETED,
+                session_id=session_id,
+                task_id=action_id,
+                steps_completed=steps,
+                steps_failed=0,
+                total_duration_ms=elapsed,
+            ))
+            await self._update_action(
+                db, action_id, "completed",
+                result={"output": output, "steps": steps, "duration_ms": elapsed},
+            )
+            return OrchestratorResult(
+                action_id=action_id,
+                status="completed",
+                task_type="web",
+                intent=decision.extracted_intent,
+                confidence=decision.confidence,
+                routing_method=decision.routing_method.value,
+                parameters=decision.parameters,
+                output=output or f"Successfully executed web task across {steps} step(s).",
+            )
+        else:
+            fail_reason = error_msg or "Web task could not be completed"
+            await _emit(session_id, TaskFailedEvent(
+                type=EventType.TASK_FAILED,
+                session_id=session_id,
+                task_id=action_id,
+                failed_at_step=steps,
+                reason=fail_reason,
+            ))
+            await self._update_action(
+                db, action_id, "failed",
+                error_message=fail_reason,
+                result={"error": fail_reason, "steps": steps, "duration_ms": elapsed},
+            )
+            return OrchestratorResult(
+                action_id=action_id,
+                status="failed",
+                task_type="web",
+                intent=decision.extracted_intent,
+                confidence=decision.confidence,
+                routing_method=decision.routing_method.value,
+                parameters=decision.parameters,
+                output=fail_reason,
+            )
+
     async def _get_plan_from_llm(self, user_input: str, decision) -> str:
-        """Ask LLM to generate an action_plan JSON block."""
-        # Collect LLM response for plan extraction
+        """
+        Ask the LLM to produce a structured action_plan JSON block.
+        Uses a dedicated system prompt so the output is compact JSON,
+        not prose, which avoids wasting tokens before the user-visible
+        stream starts (Bug #4 fix).
+        """
+        system_prompt = (
+            "You are an action planner. Given the user's request and its classification, "
+            "respond ONLY with a valid JSON object (no prose, no markdown fences, no code blocks).\n"
+            "Schema:\n"
+            '{"task_id":"<uuid>","original_intent":"<str>","steps":[<step>, ...],"requires_sequential":true}\n'
+            "Step schemas by command_type:\n"
+            '  open_url:     {"command_type":"open_url","url":"https://...","description":"<str>","risk_level":"none"}\n'
+            '  launch_app:   {"command_type":"launch_app","app_id":"<name>","description":"<str>","risk_level":"none"}\n'
+            '  create_file:  {"command_type":"create_file","path":"<path>","content":"<str>","description":"<str>","risk_level":"low"}\n'
+            '  query_llm:    {"command_type":"query_llm","query":"<str>","description":"<str>","risk_level":"none"}\n'
+            "CRITICAL: For open_url steps, always include the full 'url' field starting with https://.\n"
+            f"Task classification: {decision.task_type.value}\n"
+            f"Extracted intent: {decision.extracted_intent}"
+        )
+        plan_message = [{"role": "user", "content": system_prompt}]
         full_response = ""
-        history = []
-        async for chunk in llm_service.stream_response(history, user_input):
-            full_response += chunk
+        try:
+            async for chunk in llm_service.stream_response(plan_message, user_input):
+                full_response += chunk
+        except Exception as e:
+            logger.warning(f"Plan extraction LLM call failed: {e} — will use fallback plan")
         return full_response
+
 
     def _build_fallback_plan(self, user_input: str, decision, action_id: str) -> ActionPlan:
         """Build a minimal ActionPlan from routing decision when LLM plan is absent."""
         steps: List[BaseCommand] = []
 
         if decision.task_type == TaskType.WEB:
-            url = decision.parameters.get("url", "https://www.google.com/search?q=" + user_input.replace(" ", "+"))
-            steps.append(OpenURL(url=url, description=f"Open {url}"))
+            url = decision.parameters.get("url")
+            raw_task = decision.parameters.get("raw_task") or user_input
+            if not url:
+                url = "about:blank"
+            steps.append(OpenURL(url=url, description=raw_task))
         elif decision.task_type == TaskType.DESKTOP:
             app = decision.parameters.get("app_name", "")
             if app:
@@ -332,9 +579,13 @@ class ExecutionOrchestrator:
         db: AsyncSession,
         execution_mode: str,
         raw_input: str,
+        start_index: int = 0,
+        approved_step: Optional[int] = None,
     ):
         """Execute each step of the saga through the guard chain."""
-        steps_completed = 0
+        # When resuming after approval, earlier steps were already completed
+        # and must remain reflected in the final progress event.
+        steps_completed = start_index
         steps_failed = 0
         total_duration_ms = 0.0
         compensating_actions: List[tuple[int, BaseCommand]] = []
@@ -342,6 +593,8 @@ class ExecutionOrchestrator:
         event_emitter = lambda evt: _emit(session_id, evt)
 
         for i, command in enumerate(plan.steps):
+            if i < start_index:
+                continue
             logger.info(f"Orchestrator: step {i+1}/{len(plan.steps)} — {command.command_type.value}")
 
             # Emit step_started
@@ -396,23 +649,49 @@ class ExecutionOrchestrator:
                         reason=guard_result.block_reason or "Blocked by Malware Guard",
                     ))
                     await self._run_compensations(compensating_actions, session_id, plan.task_id)
-                    return
+                    await self._update_action(db, action_id, "failed", threat_level=guard_result.highest_risk.value)
+                    return "blocked"
                 continue
 
             # Approval gate
-            if guard_result.requires_approval:
+            if guard_result.requires_approval and i != approved_step:
                 await self._request_approval(command, guard_result, i, action_id, plan, session_id, db)
-                # For now, re-emit as awaiting_approval and return
-                # The approval flow resumes execution via approve_action()
-                return
+                # Resume this exact plan after approval; never reconstruct a
+                # single guessed command from the original sentence.
+                self._pending_sagas[action_id] = (plan, raw_input, i, execution_mode)
+                await self._update_action(
+                    db, action_id, "awaiting_approval",
+                    result={
+                        "pending_plan": plan.model_dump(mode="json"),
+                        "raw_input": raw_input,
+                        "next_step": i,
+                        "execution_mode": execution_mode,
+                    },
+                )
+                return "awaiting_approval"
 
             # Skip pure queries — no OS execution needed
             if command.command_type == CommandType.QUERY_LLM:
                 steps_completed += 1
                 continue
 
-            # Execute command
-            cmd_result: CommandResult = await os_engine.execute(command, session_id=session_id)
+            # Execute command. Interactive desktop plans use the same guard
+            # boundary as ordinary commands, then hand the full intent to the
+            # UI Automation agent so it can launch, find, click, and type.
+            if (
+                isinstance(command, LaunchApp)
+                and hasattr(os_engine, "run_desktop_agent")
+                and (
+                    _is_interactive_desktop_task(plan.original_intent)
+                    or str(getattr(command, "description", "") or "").startswith("Control desktop:")
+                )
+            ):
+                cmd_result = await os_engine.run_desktop_agent(
+                    plan.original_intent,
+                    session_id=session_id,
+                )
+            else:
+                cmd_result = await os_engine.execute(command, session_id=session_id)
             total_duration_ms += cmd_result.duration_ms
 
             await _emit(session_id, TaskStepCompletedEvent(
@@ -444,7 +723,14 @@ class ExecutionOrchestrator:
                         reason=cmd_result.error or "Step execution failed",
                     ))
                     await self._run_compensations(compensating_actions, session_id, plan.task_id)
-                    return
+                    await self._update_action(
+                        db,
+                        action_id,
+                        "failed",
+                        result={"error": cmd_result.error or "Step execution failed"},
+                        error_message=cmd_result.error or "Step execution failed",
+                    )
+                    return "failed"
 
         # All steps done
         await _emit(session_id, TaskCompletedEvent(
@@ -456,6 +742,7 @@ class ExecutionOrchestrator:
             total_duration_ms=total_duration_ms,
         ))
         await self._update_action(db, action_id, "completed")
+        return "completed"
 
     async def _run_compensations(self, compensating_actions: list, session_id: str, task_id: str):
         """Run compensating actions in reverse order for failed sagas."""
@@ -526,6 +813,8 @@ class ExecutionOrchestrator:
             return {"error": f"Action {action_id} not found"}
 
         new_status = ActionStatus.APPROVED if approved else ActionStatus.DECLINED
+        if not approved:
+            self._pending_sagas.pop(action_id, None)
         action.status = new_status
         action.completed_at = datetime.utcnow()
         await db.commit()
@@ -554,64 +843,89 @@ class ExecutionOrchestrator:
         self,
         action_id: str,
         session_id: str,
-        db: AsyncSession,
+        db: AsyncSession = None,
     ) -> dict:
-        """Execute an approved action (legacy path — used when approval flow completes)."""
+        """Resume the guarded plan after approval.
+
+        The plan is kept in memory for the lifetime of the running task. A
+        missing plan is reported explicitly instead of executing a dangerous,
+        incomplete approximation based on regexes over the original text.
+        """
+        from app.core.database import AsyncSessionLocal
         from app.models.models import ActionLog, ActionStatus
         from sqlalchemy import select
 
-        result = await db.execute(select(ActionLog).where(ActionLog.id == action_id))
-        action = result.scalar_one_or_none()
-        if not action:
-            return {"error": "Action not found"}
+        async with AsyncSessionLocal() as local_db:
+            result = await local_db.execute(select(ActionLog).where(ActionLog.id == action_id))
+            action = result.scalar_one_or_none()
+            if not action:
+                return {"error": "Action not found"}
 
-        start = datetime.utcnow()
-        action.status = ActionStatus.RUNNING
-        await db.commit()
-        await manager.send_action_update(session_id, {"id": action_id, "status": "running"})
+            start = datetime.utcnow()
+            action.status = ActionStatus.RUNNING
+            await local_db.commit()
+            await manager.send_action_update(session_id, {"id": action_id, "status": "running"})
 
-        try:
-            # Re-execute via OS engine using stored command
-            cmd_lower = (action.command or "").lower()
-            if action.action_type == "desktop":
-                if any(kw in cmd_lower for kw in ["open ", "launch ", "start ", "run "]):
-                    m = re.search(r"(?:open|launch|start|run)\s+([a-zA-Z0-9 _\-]+)", cmd_lower)
-                    app = m.group(1).strip() if m else action.command
-                    cmd = LaunchApp(app_id=app, description=f"Launch {app}")
-                elif any(kw in cmd_lower for kw in ["close ", "quit ", "exit "]):
-                    m = re.search(r"(?:close|quit|exit|end)\s+([a-zA-Z0-9 _\-]+)", cmd_lower)
-                    app = m.group(1).strip() if m else action.command
-                    cmd = CloseApp(app_id=app, description=f"Close {app}")
-                else:
-                    cmd = GetSystemInfo(description="System info")
-                result_data = await os_engine.execute(cmd, session_id=session_id)
-            elif action.action_type == "web":
-                m = re.search(r"https?://\S+|www\.\S+", action.command, re.I)
-                url = m.group() if m else "https://www.google.com"
-                if not url.startswith("http"):
-                    url = "https://" + url
-                cmd = OpenURL(url=url, description=f"Open {url}")
-                result_data = await os_engine.execute(cmd, session_id=session_id)
-            else:
-                result_data = CommandResult(command_type=CommandType.QUERY_LLM, success=True, output="Query completed")
-        except Exception as e:
-            logger.error(f"Execute error: {e}")
-            result_data = CommandResult(command_type=CommandType.QUERY_LLM, success=False, error=str(e))
+            pending = self._pending_sagas.pop(action_id, None)
+            if not pending:
+                stored = action.result or {}
+                plan_data = stored.get("pending_plan") if isinstance(stored, dict) else None
+                if isinstance(plan_data, dict):
+                    try:
+                        pending = (
+                            parse_action_plan(plan_data),
+                            stored.get("raw_input") or action.command,
+                            int(stored.get("next_step", 0)),
+                            stored.get("execution_mode") or ExecutionMode.AUTONOMOUS,
+                        )
+                    except Exception as restore_error:
+                        logger.error("Could not restore approved task plan: %s", restore_error)
+            if not pending:
+                error = "The guarded task plan is no longer available; please submit the task again."
+                action.status = ActionStatus.FAILED
+                action.error_message = error
+                action.completed_at = datetime.utcnow()
+                await local_db.commit()
+                await manager.send_action_update(session_id, {
+                    "id": action_id, "status": ActionStatus.FAILED.value, "error": error,
+                })
+                return {"action_id": action_id, "status": ActionStatus.FAILED.value, "error": error}
 
-        duration_ms = (datetime.utcnow() - start).total_seconds() * 1000
-        final_status = ActionStatus.COMPLETED if result_data.success else ActionStatus.FAILED
-        action.status = final_status
-        action.completed_at = datetime.utcnow()
-        action.duration_ms = duration_ms
-        action.result = result_data.metadata or {}
-        await db.commit()
+            plan, raw_input, start_index, execution_mode = pending
+            try:
+                saga_status = await self._execute_saga(
+                    plan=plan,
+                    action_id=action_id,
+                    session_id=session_id,
+                    db=local_db,
+                    execution_mode=execution_mode,
+                    raw_input=raw_input,
+                    start_index=start_index,
+                    approved_step=start_index,
+                )
+            except Exception as e:
+                logger.error(f"Approved task resume failed: {e}", exc_info=True)
+                saga_status = "failed"
 
-        await manager.send_action_update(session_id, {
-            "id": action_id,
-            "status": final_status.value,
-            "duration_ms": duration_ms,
-        })
-        return {"action_id": action_id, "status": final_status.value}
+            duration_ms = (datetime.utcnow() - start).total_seconds() * 1000
+            status_map = {
+                "completed": ActionStatus.COMPLETED,
+                "blocked": ActionStatus.FAILED,
+                "failed": ActionStatus.FAILED,
+                "awaiting_approval": ActionStatus.AWAITING_APPROVAL,
+            }
+            final_status = status_map.get(saga_status, ActionStatus.FAILED)
+            action.status = final_status
+            action.completed_at = datetime.utcnow()
+            action.duration_ms = duration_ms
+            await local_db.commit()
+
+            await manager.send_action_update(session_id, {
+                "id": action_id,
+                "status": final_status.value,
+                "duration_ms": duration_ms,
+            })
+            return {"action_id": action_id, "status": final_status.value}
 
     async def _log_action(self, db, action_id, session_id, action_type, description,
                           command, status, threat_level, requires_approval, error_message=""):
@@ -639,24 +953,39 @@ class ExecutionOrchestrator:
         except Exception as e:
             logger.error(f"Failed to log action: {e}")
 
-    async def _update_action(self, db, action_id, status, requires_approval=None, threat_level=None):
+    async def _update_action(
+        self,
+        db,
+        action_id,
+        status,
+        requires_approval=None,
+        threat_level=None,
+        result=None,
+        error_message=None,
+    ):
         from app.models.models import ActionLog, ActionStatus, ThreatLevel as TL
         from sqlalchemy import select, update
         try:
             status_map = {
+                "pending": ActionStatus.PENDING, "running": ActionStatus.RUNNING,
                 "completed": ActionStatus.COMPLETED, "failed": ActionStatus.FAILED,
                 "awaiting_approval": ActionStatus.AWAITING_APPROVAL,
             }
             update_vals = {
                 "status": status_map.get(status, ActionStatus.COMPLETED),
-                "completed_at": datetime.utcnow(),
             }
+            if status not in {"pending", "running"}:
+                update_vals["completed_at"] = datetime.utcnow()
             if requires_approval is not None:
                 update_vals["requires_approval"] = requires_approval
             if threat_level:
                 threat_map = {"none": TL.NONE, "low": TL.LOW, "medium": TL.MEDIUM,
                               "high": TL.HIGH, "critical": TL.CRITICAL}
                 update_vals["threat_level"] = threat_map.get(threat_level, TL.NONE)
+            if result is not None:
+                update_vals["result"] = result
+            if error_message is not None:
+                update_vals["error_message"] = error_message
             await db.execute(
                 update(ActionLog).where(ActionLog.id == action_id).values(**update_vals)
             )

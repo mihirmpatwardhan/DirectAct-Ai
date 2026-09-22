@@ -5,7 +5,6 @@ import {
   ChevronRight, ToggleLeft, ToggleRight, RefreshCw,
 } from 'lucide-react';
 import { useAppStore } from '../../store/appStore';
-import { useWebSocket } from '../../hooks/useWebSocket';
 import { fetchActions, approveAction } from '../../lib/api';
 import type { ActionLog } from '../../types';
 import type { RiskLevel, GuardCheckName } from '../../types/events';
@@ -104,7 +103,9 @@ const ExecutionModeToggle: React.FC = () => {
 // Main Panel
 // ──────────────────────────────────────────────────────────────────────────────
 
-export const TimelinePanel: React.FC = () => {
+export const TimelinePanel: React.FC<{
+  sendApproval: (actionId: string, approved: boolean) => void;
+}> = ({ sendApproval }) => {
   const {
     activeTab, setActiveTab,
     actions,
@@ -117,7 +118,6 @@ export const TimelinePanel: React.FC = () => {
     auditLog,
     onPermissionResolved,
   } = useAppStore();
-  const { sendApproval } = useWebSocket(activeSessionId);
 
   // Load legacy action history
   useEffect(() => {

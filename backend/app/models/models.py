@@ -43,11 +43,33 @@ class ThreatLevel(str, enum.Enum):
     CRITICAL = "critical"
 
 
+class User(Base):
+    """User account — email + password used for both app login and browser automation."""
+    __tablename__ = "users"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    email: Mapped[str] = mapped_column(String(255), unique=True, nullable=False, index=True)
+    hashed_password: Mapped[str] = mapped_column(String(255), nullable=False)
+    avatar_url: Mapped[str] = mapped_column(String(500), default="")
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
+    )
+
+    # Relationships
+    sessions: Mapped[list["Session"]] = relationship(
+        back_populates="user", cascade="all, delete-orphan", lazy="selectin"
+    )
+
+
 class Session(Base):
     __tablename__ = "sessions"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     name: Mapped[str] = mapped_column(String(255), default="New Session")
+    user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), nullable=True)
     status: Mapped[SessionStatus] = mapped_column(
         Enum(SessionStatus), default=SessionStatus.ACTIVE
     )
@@ -64,6 +86,7 @@ class Session(Base):
     actions: Mapped[list["ActionLog"]] = relationship(
         back_populates="session", cascade="all, delete-orphan", lazy="selectin"
     )
+    user: Mapped["User"] = relationship(back_populates="sessions")
 
 
 class Message(Base):

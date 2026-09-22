@@ -1,11 +1,9 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
 @import "tailwindcss";
 
 /* ============================================================
    DirectAct-AI Design System
    ============================================================ */
-
-/* Custom Fonts */
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
 
 :root {
   /* Color Palette — Dark Mode First */
@@ -93,33 +91,14 @@ code, pre, .font-mono {
    ============================================================ */
 .app-shell {
   display: grid;
-  grid-template-columns: var(--sidebar-width) var(--chat-width, 340px) 1fr var(--timeline-width);
+  grid-template-columns: var(--sidebar-width, 240px) 1fr var(--timeline-width, 360px);
   grid-template-rows: 48px 1fr;
   height: 100vh;
   background: var(--bg-base);
   overflow: hidden;
   transition: all 0.3s ease;
-}
-
-/* Mode: Large Viewport (Default: Compact Chat, Large Browser Viewport) */
-.app-shell.mode-large {
-  --chat-width: 340px;
-  --sidebar-width: 220px;
-  --timeline-width: 280px;
-}
-
-/* Mode: Cinema (Ultra-wide Browser Viewport) */
-.app-shell.mode-cinema {
-  --chat-width: 260px;
-  --sidebar-width: 180px;
-  --timeline-width: 240px;
-}
-
-/* Mode: Equal Split */
-.app-shell.mode-equal {
-  --chat-width: 1fr;
-  --sidebar-width: 200px;
-  --timeline-width: 280px;
+  --sidebar-width: 240px;
+  --timeline-width: 360px;
 }
 
 .app-topbar {

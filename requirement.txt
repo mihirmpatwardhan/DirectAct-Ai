@@ -1,6 +1,12 @@
 browser-use==0.13.1
+# Keep the standalone browser agent on the dependency versions required by
+# browser-use 0.13.1 (and compatible with the backend provider clients).
+pydantic==2.12.5
+openai==2.16.0
+httpx==0.28.1
+websockets==15.0.1
+python-dotenv==1.2.2
 streamlit>=1.28.0
-python-dotenv>=1.0.0
 playwright>=1.40.0
 google-generativeai>=0.3.0
 langchain-google-genai>=2.0.0

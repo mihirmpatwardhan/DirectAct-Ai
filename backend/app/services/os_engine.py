@@ -96,20 +96,6 @@ def _build_win_app_map() -> dict:
         "powershell": os.path.join(windir, "System32", "WindowsPowerShell", "v1.0", "powershell.exe"),
         "paint": os.path.join(windir, "System32", "mspaint.exe"),
         "wordpad": os.path.join(windir, "System32", "write.exe"),
-        "chrome": os.path.join(program_files, "Google", "Chrome", "Application", "chrome.exe"),
-        "vscode": os.path.join(local_appdata, "Programs", "Microsoft VS Code", "Code.exe"),
-        "code": os.path.join(local_appdata, "Programs", "Microsoft VS Code", "Code.exe"),
-        "msedge": os.path.join(program_files, "Microsoft", "Edge", "Application", "msedge.exe"),
-        "edge": os.path.join(program_files, "Microsoft", "Edge", "Application", "msedge.exe"),
-        "firefox": os.path.join(program_files, "Mozilla Firefox", "firefox.exe"),
-        "winrar": os.path.join(program_files, "WinRAR", "WinRAR.exe"),
-        "7zip": os.path.join(program_files, "7-Zip", "7z.exe"),
-        "vlc": os.path.join(program_files, "VideoLAN", "VLC", "vlc.exe"),
-        "teams": os.path.join(local_appdata, "Microsoft", "Teams", "current", "Teams.exe"),
-        "zoom": os.path.join(local_appdata, "Zoom", "bin", "Zoom.exe"),
-        "discord": os.path.join(local_appdata, "Discord", "Update.exe"),
-        "spotify": os.path.join(local_appdata, "Microsoft", "WindowsApps", "Spotify.exe"),
-        "slack": os.path.join(local_appdata, "slack", "slack.exe"),
         "task manager": os.path.join(windir, "System32", "Taskmgr.exe"),
         "taskmgr": os.path.join(windir, "System32", "Taskmgr.exe"),
         "regedit": os.path.join(windir, "regedit.exe"),
@@ -117,11 +103,27 @@ def _build_win_app_map() -> dict:
         "snipping tool": os.path.join(windir, "System32", "SnippingTool.exe"),
     }
 
-    # Try App Paths registry key for additional apps
+    # Try App Paths registry key for dynamically discovered apps
     try:
         import winreg
         key_path = r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths"
         with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key_path) as root:
+            i = 0
+            while True:
+                try:
+                    name = winreg.EnumKey(root, i)
+                    with winreg.OpenKey(root, name) as sub:
+                        try:
+                            path = winreg.QueryValue(sub, "")
+                            app_name = name.replace(".exe", "").lower()
+                            if path and os.path.exists(path):
+                                well_known[app_name] = path
+                        except Exception:
+                            pass
+                    i += 1
+                except OSError:
+                    break
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path) as root:
             i = 0
             while True:
                 try:
@@ -223,8 +225,46 @@ class WindowsAutomationEngine(OSAutomationEngine):
 
     async def _launch_app(self, cmd: LaunchApp, session_id: str) -> CommandResult:
         t0 = datetime.utcnow()
-        app_map = _build_win_app_map()
         lower = cmd.app_id.lower().strip()
+
+        # 0. URL detection -> universal os.startfile
+        import re
+        is_url = bool(re.match(r"^https?://", lower, re.I) or re.match(r"^www\.", lower, re.I) or re.search(r"\.[a-zA-Z]{2,}(?:/.*)?$", lower))
+        if is_url:
+            url = cmd.app_id if cmd.app_id.startswith("http") else f"https://{cmd.app_id}"
+            def _launch_url():
+                try:
+                    os.startfile(url)
+                    return True, f"Opened URL {url}"
+                except Exception:
+                    subprocess.Popen(["cmd.exe", "/c", f"start {url}"], shell=True)
+                    return True, f"Opened URL {url}"
+            loop = asyncio.get_running_loop()
+            success, msg = await loop.run_in_executor(None, _launch_url)
+            duration_ms = (datetime.utcnow() - t0).total_seconds() * 1000
+            return self._result(cmd, success, output=msg, duration_ms=duration_ms)
+
+        # 1. Dynamic app discovery
+        try:
+            from app.services.app_discovery import app_discovery
+            resolved = app_discovery.resolve(lower)
+            if resolved:
+                if resolved.app_user_model_id:
+                    safe = resolved.app_user_model_id.replace("'", "''")
+                    script = f"Start-Process 'shell:AppsFolder\\{safe}'"
+                    out, err, code = await self._ps(script, timeout=15)
+                    if code == 0:
+                        duration_ms = (datetime.utcnow() - t0).total_seconds() * 1000
+                        return self._result(cmd, True, output=f"Launched {resolved.name}", duration_ms=duration_ms)
+                if resolved.executable_path and os.path.exists(resolved.executable_path):
+                    subprocess.Popen([resolved.executable_path] + cmd.arguments)
+                    duration_ms = (datetime.utcnow() - t0).total_seconds() * 1000
+                    return self._result(cmd, True, output=f"Launched {resolved.name} via path: {resolved.executable_path}", duration_ms=duration_ms)
+        except Exception as e:
+            logger.debug(f"app_discovery resolution failed: {e}")
+
+        # 2. System32 well-known map
+        app_map = _build_win_app_map()
         exe_path = app_map.get(lower)
 
         def _do_launch():
@@ -437,6 +477,127 @@ Write-Output '{save_path_ps}'
         duration_ms = (datetime.utcnow() - t0).total_seconds() * 1000
         return self._result(cmd, code == 0, output=out, error=err if code != 0 else None, duration_ms=duration_ms)
 
+    async def run_desktop_agent(self, user_intent: str, session_id: str = "") -> CommandResult:
+        """Autonomous UIA + LLM agent loop for desktop automation."""
+        import time
+        from app.services.desktop_agent_client import desktop_client
+        from app.services.llm_service import llm_service
+        from app.core.websocket_manager import manager
+
+        t0 = datetime.utcnow()
+        max_steps = 15
+        history: list[str] = []
+
+        for step in range(1, max_steps + 1):
+            snapshot = await desktop_client.snapshot()
+            screenshot = await desktop_client.screenshot()
+
+            if session_id and screenshot:
+                if hasattr(manager, "send_viewport_frame"):
+                    await manager.send_viewport_frame(session_id, screenshot)
+
+            prompt = f"""You are DirectAct-AI Desktop Automation Agent controlling a real Windows desktop.
+User Intent: {user_intent}
+
+Action history:
+{chr(10).join(history) if history else "None"}
+
+Current visible windows and accessibility controls:
+{snapshot[:12000]}
+
+Decide the next single action to achieve the user intent.
+Respond with EXACTLY one valid JSON object (no markdown, no prose):
+{{"action": "launch"|"focus"|"click"|"type"|"keys"|"scroll"|"wait"|"done"|"fail", "target": "<app, window, url, or button name>", "value": "<text to type or keys to press or scroll direction (up/down)>", "reason": "<one sentence explanation>"}}
+
+Actions:
+- launch: launch an app by name or open a URL (target = app name or URL)
+- focus: bring a window to front (target = window title substring)
+- click: click an element (target = control text / button name)
+- type: type text into the focused control (target = app name, value = text)
+- keys: press keys like {{ENTER}}, {{TAB}}, ^s, ^a (target = app name, value = keys)
+- scroll: scroll the active window (target = "up" or "down", value = number of lines)
+- wait: pause for N seconds (target = seconds)
+- done: finished successfully (reason = summary of what was accomplished)
+- fail: unable to continue (reason = cause)
+
+IMPORTANT:
+- Only use "done" AFTER the full task is completed (text typed, button clicked, etc.)
+- If you just launched an app, the next step should interact with it (click/type/etc.)
+- If a control is not found by name, try scrolling or waiting then retry
+"""
+            decision = await llm_service.complete_json(prompt, timeout=45.0)
+            if not decision or "action" not in decision:
+                continue
+
+            action = str(decision.get("action", "")).lower().strip()
+            target = str(decision.get("target", "")).strip()
+            value = str(decision.get("value", "")).strip()
+            reason = str(decision.get("reason", "")).strip()
+
+            step_desc = f"Step {step}: [{action}] {target} {value} ({reason})".strip()
+            history.append(step_desc)
+            logger.info("Desktop agent: %s", step_desc)
+
+            if session_id:
+                await manager.send_action_update(session_id, {
+                    "id": f"step-{step}-{int(time.time())}",
+                    "session_id": session_id,
+                    "action_type": "desktop",
+                    "description": step_desc,
+                    "status": "running",
+                    "threat_level": "none",
+                    "requires_approval": False,
+                })
+
+            if action == "done":
+                duration_ms = (datetime.utcnow() - t0).total_seconds() * 1000
+                return self._result(
+                    LaunchApp(app_id=target or "desktop", description=user_intent),
+                    True,
+                    output=f"Task completed successfully: {reason}",
+                    duration_ms=duration_ms,
+                )
+            elif action == "fail":
+                duration_ms = (datetime.utcnow() - t0).total_seconds() * 1000
+                return self._result(
+                    LaunchApp(app_id=target or "desktop", description=user_intent),
+                    False,
+                    error=f"Task failed: {reason}",
+                    duration_ms=duration_ms,
+                )
+            elif action == "launch":
+                await desktop_client.launch(target)
+                await asyncio.sleep(2.0)
+            elif action == "focus":
+                await desktop_client.focus(target)
+                await asyncio.sleep(0.5)
+            elif action == "click":
+                await desktop_client.click(target)
+                await asyncio.sleep(0.8)
+            elif action == "type":
+                await desktop_client.type_text(target, value)
+                await asyncio.sleep(0.5)
+            elif action == "keys":
+                await desktop_client.keys(target, value)
+                await asyncio.sleep(0.5)
+            elif action == "wait":
+                try:
+                    sec = float(target) if target else 1.0
+                except ValueError:
+                    sec = 1.0
+                await asyncio.sleep(min(sec, 5.0))
+            elif action == "scroll":
+                await desktop_client.send("scroll", target=target or "down", value=value or "3", timeout=5.0)
+                await asyncio.sleep(0.4)
+
+        duration_ms = (datetime.utcnow() - t0).total_seconds() * 1000
+        return self._result(
+            LaunchApp(app_id="desktop", description=user_intent),
+            True,
+            output=f"Desktop agent completed maximum steps ({max_steps})",
+            duration_ms=duration_ms,
+        )
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Linux Engine (Phase 1 Stub)
@@ -530,3 +691,22 @@ def create_os_engine() -> OSAutomationEngine:
 
 # Singleton — selected at startup
 os_engine: OSAutomationEngine = create_os_engine()
+
+
+def _desktop_ui_snapshot() -> str:
+    """Convenience synchronous snapshot helper for tests and external scripts."""
+    from app.services.desktop_agent_client import desktop_client
+    try:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        if loop and loop.is_running():
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                return pool.submit(lambda: asyncio.run(desktop_client.snapshot())).result(timeout=15)
+        else:
+            return asyncio.run(desktop_client.snapshot())
+    except Exception as exc:
+        return f"(Snapshot unavailable: {exc})"

@@ -5,12 +5,15 @@ import { useAppStore } from '../../store/appStore';
 import { fetchSessions, createSession, deleteSession } from '../../lib/api';
 import type { Session } from '../../types';
 
-interface SidebarProps {
-  onSessionSelect: (id: string) => void;
-}
-
-export const Sidebar: React.FC<SidebarProps> = ({ onSessionSelect }) => {
-  const { sessions, activeSessionId, setSessions, addSession, setActiveSession } = useAppStore();
+export const Sidebar: React.FC = () => {
+  const {
+    sessions,
+    activeSessionId,
+    setSessions,
+    addSession,
+    setActiveSession,
+    setMessages,
+  } = useAppStore();
   const [isCreating, setIsCreating] = useState(false);
 
   useEffect(() => {
@@ -18,15 +21,16 @@ export const Sidebar: React.FC<SidebarProps> = ({ onSessionSelect }) => {
       .then(async (s) => {
         setSessions(s);
         if (s.length > 0) {
+          // Clear any stale messages before activating the first session
+          setMessages(s[0].id, []);
           setActiveSession(s[0].id);
-          onSessionSelect(s[0].id);
         } else {
           // Auto-create initial session if none exist
           try {
             const newSess = await createSession(`Session ${format(new Date(), 'MMM d HH:mm')}`);
             addSession(newSess);
+            setMessages(newSess.id, []);
             setActiveSession(newSess.id);
-            onSessionSelect(newSess.id);
           } catch (err) {
             console.error('Auto session creation failed', err);
           }
@@ -42,8 +46,9 @@ export const Sidebar: React.FC<SidebarProps> = ({ onSessionSelect }) => {
     try {
       const session = await createSession(`Session ${format(new Date(), 'MMM d HH:mm')}`);
       addSession(session);
+      // Clear messages immediately so the new chat starts totally empty
+      setMessages(session.id, []);
       setActiveSession(session.id);
-      onSessionSelect(session.id);
     } catch (e) {
       console.error('Failed to create session', e);
     } finally {
@@ -52,8 +57,11 @@ export const Sidebar: React.FC<SidebarProps> = ({ onSessionSelect }) => {
   };
 
   const handleSelectSession = (session: Session) => {
+    if (session.id === activeSessionId) return; // already active — no-op
+    // Immediately wipe the message cache for this session so the old
+    // session's messages never flash before fetchMessages completes.
+    setMessages(session.id, []);
     setActiveSession(session.id);
-    onSessionSelect(session.id);
   };
 
   const handleDeleteSession = async (e: React.MouseEvent, session: Session) => {
@@ -63,7 +71,13 @@ export const Sidebar: React.FC<SidebarProps> = ({ onSessionSelect }) => {
       const updated = sessions.filter((s) => s.id !== session.id);
       setSessions(updated);
       if (activeSessionId === session.id) {
-        setActiveSession(updated[0]?.id ?? null);
+        const next = updated[0] ?? null;
+        if (next) {
+          setMessages(next.id, []);
+          setActiveSession(next.id);
+        } else {
+          setActiveSession(null);
+        }
       }
     } catch {
       console.error('Failed to delete session');
@@ -81,14 +95,14 @@ export const Sidebar: React.FC<SidebarProps> = ({ onSessionSelect }) => {
           disabled={isCreating}
         >
           <Plus size={14} />
-          {isCreating ? 'Creating…' : 'New Session'}
+          {isCreating ? 'Creating…' : 'New Chat'}
         </button>
       </div>
 
       <div className="session-list">
         {sessions.length === 0 && (
           <div style={{ padding: '20px 12px', textAlign: 'center', color: 'var(--text-muted)', fontSize: 12 }}>
-            No sessions yet.<br />Create one to get started.
+            No chats yet.<br />Hit <strong>+ New Chat</strong> to begin.
           </div>
         )}
         {sessions.map((session) => (
@@ -113,7 +127,7 @@ export const Sidebar: React.FC<SidebarProps> = ({ onSessionSelect }) => {
         gap: 6,
       }}>
         <MessageSquare size={11} />
-        {sessions.length} session{sessions.length !== 1 ? 's' : ''}
+        {sessions.length} chat{sessions.length !== 1 ? 's' : ''}
       </div>
     </div>
   );
@@ -149,7 +163,7 @@ const SessionItem: React.FC<{
           className="btn-icon"
           style={{ width: 22, height: 22 }}
           onClick={onDelete}
-          title="Delete session"
+          title="Delete chat"
         >
           <Trash2 size={11} />
         </button>
@@ -159,3 +173,4 @@ const SessionItem: React.FC<{
     </div>
   );
 };
+

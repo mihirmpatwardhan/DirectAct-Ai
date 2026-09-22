@@ -55,7 +55,9 @@ class ActionSequenceCache:
 
     def __init__(self):
         self._cache: dict[str, CachedSequence] = {}
-        self._populate_defaults()
+        # Cache only plans produced and verified by the live agent. Never ship
+        # site/app-specific canned sequences: they become stale and can claim
+        # success without observing the current UI.
 
     def _normalize_intent(self, intent: str) -> str:
         """
@@ -163,51 +165,6 @@ class ActionSequenceCache:
             return
         oldest_key = min(self._cache, key=lambda k: self._cache[k].last_used_at)
         del self._cache[oldest_key]
-
-    def _populate_defaults(self):
-        """Pre-populate with common routine task templates."""
-        defaults = [
-            {
-                "intent": "check weather in mumbai",
-                "task_type": "web",
-                "steps": [
-                    CachedActionStep("navigate", "https://www.google.com/search?q=weather+in+mumbai", None, "Navigate to Google weather search"),
-                    CachedActionStep("screenshot", "body", None, "Capture weather results"),
-                ],
-            },
-            {
-                "intent": "play songs by arijit singh",
-                "task_type": "web",
-                "steps": [
-                    CachedActionStep("navigate", "https://www.youtube.com/results?search_query=arijit+singh+songs", None, "Navigate to YouTube search"),
-                    CachedActionStep("click", "ytd-video-renderer:first-child", None, "Click first result"),
-                ],
-            },
-            {
-                "intent": "open notepad",
-                "task_type": "desktop",
-                "steps": [
-                    CachedActionStep("powershell", "Start-Process notepad.exe", None, "Launch Notepad"),
-                ],
-            },
-            {
-                "intent": "open calculator",
-                "task_type": "desktop",
-                "steps": [
-                    CachedActionStep("powershell", "Start-Process calc.exe", None, "Launch Calculator"),
-                ],
-            },
-        ]
-
-        for item in defaults:
-            key = self._normalize_intent(item["intent"])
-            self._cache[key] = CachedSequence(
-                cache_key=key,
-                original_intent=item["intent"],
-                steps=item["steps"],
-                task_type=item["task_type"],
-            )
-
 
 # Singleton
 action_cache = ActionSequenceCache()

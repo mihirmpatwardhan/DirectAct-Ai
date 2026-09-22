@@ -72,6 +72,8 @@ export interface ViewportFrame {
   timestamp: string;
 }
 
+const lockedHistoryStreams = new Set<string>();
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Store interface
 // ──────────────────────────────────────────────────────────────────────────────
@@ -195,24 +197,59 @@ export const useAppStore = create<AppState>()(
       }),
 
     setMessages: (sessionId, messages) =>
-      set((state) => { state.messages[sessionId] = messages; }),
+      set((state) => {
+        // Only overwrite if there's no active stream for this session
+        // to avoid wiping in-flight streamed bubbles on reconnect.
+        const existing = state.messages[sessionId] ?? [];
+        const hasActiveStream = existing.some((m: Message) => m.isStreaming);
+        if (hasActiveStream) return;
+        // Deduplicate: prefer existing in-memory messages if same id already loaded
+        const existingIds = new Set(existing.map((m: Message) => m.id));
+        const persistedUserMessages = new Set(
+          messages
+            .filter((m: Message) => m.role === 'user')
+            .map((m: Message) => m.content.trim())
+        );
+        const merged = [
+          // Replace optimistic `temp-user-*` bubbles with their persisted
+          // server versions when history arrives. Otherwise every command
+          // appears twice after the websocket response is saved.
+          ...existing.filter((m: Message) =>
+            !(m.id.startsWith('temp-user-') && persistedUserMessages.has(m.content.trim()))
+          ),
+          ...messages.filter((m: Message) => !existingIds.has(m.id)),
+        ];
+        merged.sort((a: Message, b: Message) =>
+          new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
+        );
+        state.messages[sessionId] = merged;
+      }),
 
     appendStreamChunk: (sessionId, messageId, chunk) =>
       set((state) => {
+        if (!state.messages[sessionId]) state.messages[sessionId] = [];
         const msgs = state.messages[sessionId];
-        if (!msgs) return;
         const msg = msgs.find((m: Message) => m.id === messageId);
         if (msg) {
+          if (lockedHistoryStreams.has(messageId)) return;
+          // History already loaded the full message — do not append the same stream again.
+          if (!msg.isStreaming && msg.content && msg.content.trim().length > 0) {
+            lockedHistoryStreams.add(messageId);
+            return;
+          }
           msg.content += chunk;
+          msg.isStreaming = true;
         } else {
-          msgs.push({
-            id: messageId,
-            session_id: sessionId,
-            role: 'assistant',
-            content: chunk,
-            created_at: new Date().toISOString(),
-            isStreaming: true,
-          });
+          if (!msgs.some((m: Message) => m.id === messageId)) {
+            msgs.push({
+              id: messageId,
+              session_id: sessionId,
+              role: 'assistant',
+              content: chunk,
+              created_at: new Date().toISOString(),
+              isStreaming: true,
+            });
+          }
         }
       }),
 
@@ -221,7 +258,16 @@ export const useAppStore = create<AppState>()(
         const msgs = state.messages[sessionId];
         if (!msgs) return;
         const msg = msgs.find((m: Message) => m.id === messageId);
-        if (msg) msg.isStreaming = false;
+        if (msg) {
+          msg.isStreaming = false;
+          lockedHistoryStreams.delete(messageId);
+          // Strip raw action_plan JSON blocks — these are internal planning
+          // artifacts that should never appear in the user-facing chat.
+          msg.content = msg.content
+            .replace(/```action_plan\s*[\s\S]*?```/gi, '')
+            .replace(/```json\s*\{[\s\S]*?"steps"[\s\S]*?```/gi, '')
+            .trim();
+        }
       }),
 
     // ── Action mutations (legacy) ────────────────────────────────────────────
@@ -302,7 +348,11 @@ export const useAppStore = create<AppState>()(
     onTaskFailed: (task_id, reason) =>
       set((state) => {
         const task = state.activeTasks[task_id];
-        if (task) task.status = 'failed';
+        // FIX: store the failure reason so the UI can display why it failed
+        if (task) {
+          task.status = 'failed';
+          (task as any).failure_reason = reason ?? 'Unknown error';
+        }
       }),
 
     onSecurityCheckResult: (evt) =>

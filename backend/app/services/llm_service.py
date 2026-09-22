@@ -122,6 +122,42 @@ class KeyCircuitBreaker:
         return True
 
 
+def _is_retryable_error(e: Exception) -> bool:
+    err_str = str(e).lower()
+    return any(term in err_str for term in [
+        "503", "unavailable", "overloaded", "resource exhausted",
+        "429", "rate limit", "deadline exceeded", "try again later",
+        "service unavailable", "temporary failure"
+    ])
+
+
+def _is_quota_error(e: Exception) -> bool:
+    err_str = str(e).lower()
+    return any(term in err_str for term in ["quota", "per_minute", "per_day", "rate limit", "exceeded your current quota"])
+
+
+def _extract_json(text: str) -> dict:
+    if not text:
+        return {}
+    cleaned = text.strip()
+    import re
+    if "```" in cleaned:
+        match = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", cleaned, re.DOTALL)
+        if match:
+            cleaned = match.group(1).strip()
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        start = cleaned.find("{")
+        end = cleaned.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            try:
+                return json.loads(cleaned[start:end + 1])
+            except Exception:
+                pass
+    return {}
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Abstract LLM Provider (Strategy pattern)
 # ──────────────────────────────────────────────────────────────────────────────
@@ -153,6 +189,9 @@ class LLMProvider(ABC):
         max_tokens: int = 512,
         temperature: float = 0.2,
     ) -> str: ...
+
+    @abstractmethod
+    async def complete_json(self, prompt: str) -> dict: ...
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -233,10 +272,28 @@ class GeminiProvider(LLMProvider):
         if not self._client:
             raise RuntimeError("Gemini client not initialized")
         loop = asyncio.get_event_loop()
-        response = await loop.run_in_executor(
-            None, lambda: self._client.generate_content(prompt)
-        )
-        return response.text.strip()
+        retries = 3
+        backoff = 1.0
+        for attempt in range(retries):
+            try:
+                response = await loop.run_in_executor(
+                    None, lambda: self._client.generate_content(prompt)
+                )
+                return response.text.strip()
+            except Exception as e:
+                if attempt < retries - 1 and _is_retryable_error(e):
+                    logger.warning(
+                        f"GeminiProvider complete retry {attempt + 1}/{retries} "
+                        f"after transient error: {e}. Backing off {backoff:.1f}s"
+                    )
+                    await asyncio.sleep(backoff)
+                    backoff *= 2.0
+                else:
+                    raise
+
+    async def complete_json(self, prompt: str) -> dict:
+        text = await self.complete(prompt, max_tokens=1024, temperature=0.1)
+        return _extract_json(text)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -292,6 +349,10 @@ class OpenAIProvider(LLMProvider):
         )
         return resp.choices[0].message.content or ""
 
+    async def complete_json(self, prompt: str) -> dict:
+        text = await self.complete(prompt, max_tokens=1024, temperature=0.1)
+        return _extract_json(text)
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Stub Provider (no API key configured)
@@ -345,6 +406,9 @@ class StubProvider(LLMProvider):
 
     async def complete(self, prompt: str, max_tokens: int = 512, temperature: float = 0.2) -> str:
         return '{"task_type": "query", "confidence": 0.5, "intent": "stub", "parameters": {}, "requires_approval": false}'
+
+    async def complete_json(self, prompt: str) -> dict:
+        return {"action": "done", "target": "stub", "status": "completed"}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -479,6 +543,15 @@ class LLMService:
             return pair[0].provider_name
         return "stub"
 
+    async def warm_up(self):
+        """Warm up LLM client in background thread so first request isn't slow."""
+        try:
+            pair = self._rotation_manager.get_available()
+            if pair:
+                logger.info(f"LLMService: warmed up provider {pair[0].provider_name}")
+        except Exception as e:
+            logger.debug(f"LLMService warm_up error: {e}")
+
     async def stream_response(
         self,
         history: List[Dict[str, str]],
@@ -548,6 +621,38 @@ class LLMService:
             return {"task_type": "query", "confidence": 0.5, "intent": user_input[:80],
                     "parameters": {}, "requires_approval": False}
 
+    async def complete_json(self, prompt: str, timeout: float = 60.0) -> dict:
+        """Complete a prompt constrained to JSON with rotation across providers/keys."""
+        pair = self._rotation_manager.get_available()
+        if not pair:
+            return await self._stub.complete_json(prompt)
+
+        provider, cb = pair
+        try:
+            res = await asyncio.wait_for(provider.complete_json(prompt), timeout=timeout)
+            if res:
+                self._rotation_manager.mark_success(cb)
+                return res
+        except Exception as e:
+            is_quota = _is_quota_error(e)
+            self._rotation_manager.mark_failure(cb, is_quota=is_quota)
+            logger.warning(f"Provider {provider.provider_name} complete_json failed: {e}. Attempting rotation...")
+
+            # Try next available key/provider
+            next_pair = self._rotation_manager.get_available()
+            if next_pair and next_pair[0] is not provider:
+                next_provider, next_cb = next_pair
+                try:
+                    res2 = await asyncio.wait_for(next_provider.complete_json(prompt), timeout=timeout)
+                    if res2:
+                        self._rotation_manager.mark_success(next_cb)
+                        return res2
+                except Exception as e2:
+                    self._rotation_manager.mark_failure(next_cb, is_quota=_is_quota_error(e2))
+                    logger.error(f"Fallback provider complete_json also failed: {e2}")
+
+        return {}
+
     async def parse_action_plan_from_response(self, llm_response: str) -> Optional[dict]:
         """Extract and parse a ```action_plan``` JSON block from LLM response."""
         import re
@@ -564,3 +669,14 @@ class LLMService:
 
 # Singleton
 llm_service = LLMService()
+
+
+def strip_planner_artifacts(text: str) -> str:
+    """Remove ```action_plan ... ``` and raw JSON blocks from LLM natural response."""
+    import re
+    if not text:
+        return ""
+    cleaned = re.sub(r"```(?:action_plan|json)?\s*\{.*?\n```", "", text, flags=re.DOTALL)
+    cleaned = re.sub(r"```action_plan.*?```", "", cleaned, flags=re.DOTALL)
+    return cleaned.strip()
+

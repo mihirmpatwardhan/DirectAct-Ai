@@ -124,10 +124,34 @@ def _get_or_create_key() -> bytes:
         logger.info("VaultService: generated and stored new master key in OS keychain")
         return raw_key
     except Exception as e:
-        logger.warning(f"VaultService: keyring unavailable ({e}), using session-only key")
-        # Fallback: session-only key (not persisted — vault data won't survive restart)
+        logger.warning(f"VaultService: keyring unavailable ({e}), using file-based fallback key")
+        fallback_key_path = os.path.join("./logs", ".vault_fallback.key")
+        os.makedirs(os.path.dirname(fallback_key_path), exist_ok=True)
+
+        # Load from file if it already exists (key survives restart)
+        if os.path.exists(fallback_key_path):
+            try:
+                with open(fallback_key_path, "rb") as f:
+                    existing_key = f.read()
+                if len(existing_key) == 32:
+                    logger.info("VaultService: loaded persisted fallback key from disk")
+                    return existing_key
+            except Exception as read_err:
+                logger.error(f"VaultService: could not read fallback key ({read_err}) — generating new one (vault data will be inaccessible)")
+
+        # Generate a new 256-bit key and save to disk so it survives restart
         import secrets
-        return secrets.token_bytes(32)
+        raw_key = secrets.token_bytes(32)
+        try:
+            with open(fallback_key_path, "wb") as f:
+                f.write(raw_key)
+            # Restrict permissions on Windows: owner-only read/write
+            import stat
+            os.chmod(fallback_key_path, stat.S_IRUSR | stat.S_IWUSR)
+            logger.info(f"VaultService: new fallback key saved to {fallback_key_path}")
+        except Exception as write_err:
+            logger.warning(f"VaultService: could not persist fallback key ({write_err}) — session-only for this run")
+        return raw_key
 
 
 def _encrypt(plaintext: str, key: bytes) -> str:

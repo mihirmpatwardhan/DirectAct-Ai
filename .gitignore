@@ -35,5 +35,8 @@ backend/logs/
 # IDE & System files
 .vscode/
 .idea/
+.cursor/
+.pytest_cache/
+*scratch*
 .DS_Store
 Thumbs.db

@@ -1,0 +1,12 @@
+{
+  "manifest_version": 3,
+  "name": "DirectAct-AI Live Chrome Bridge",
+  "version": "1.3.0",
+  "description": "Connects DirectAct-AI to Chrome without copying profile data.",
+  "permissions": ["debugger", "tabs", "storage"],
+  "host_permissions": ["<all_urls>"],
+  "background": { "service_worker": "service_worker.js" },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'; connect-src http://127.0.0.1:8000 ws://127.0.0.1:8000 http://localhost:8000 ws://localhost:8000"
+  }
+}

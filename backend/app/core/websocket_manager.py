@@ -24,8 +24,22 @@ class ConnectionManager:
         self.active_connections: Dict[str, Set[WebSocket]] = {}
 
     async def connect(self, websocket: WebSocket, session_id: str):
-        """Accept and register a new WebSocket connection."""
+        """Accept and register a new WebSocket connection.
+
+        Only one live socket is kept per session so React StrictMode remounts
+        and reconnects cannot double-append the same stream chunks.
+        """
         await websocket.accept()
+        existing = self.active_connections.get(session_id)
+        if existing:
+            for old in list(existing):
+                if old is websocket:
+                    continue
+                try:
+                    await old.close()
+                except Exception:
+                    pass
+                existing.discard(old)
         if session_id not in self.active_connections:
             self.active_connections[session_id] = set()
         self.active_connections[session_id].add(websocket)

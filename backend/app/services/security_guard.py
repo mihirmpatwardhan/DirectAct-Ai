@@ -709,6 +709,32 @@ class MalwareGuard:
             all_verdicts=all_verdicts,
         )
 
+    def scan_url(self, url: str) -> GuardVerdict:
+        """Scan a URL for blocklist rules (used by WebAutomationEngine)."""
+        if not url or not isinstance(url, str):
+            return GuardVerdict(
+                action=GuardAction.BLOCK,
+                reason="Empty or invalid URL",
+                risk_level=RiskLevel.CRITICAL
+            )
+
+        # Basic blocklist patterns
+        blocked_keywords = ["malicious", "phishing", "exploit-db.com", "metasploit"]
+        url_lower = url.lower()
+        for kw in blocked_keywords:
+            if kw in url_lower:
+                return GuardVerdict(
+                    action=GuardAction.BLOCK,
+                    reason=f"URL blocked: keyword '{kw}' is blacklisted",
+                    risk_level=RiskLevel.CRITICAL
+                )
+
+        return GuardVerdict(
+            action=GuardAction.ALLOW,
+            reason="URL policy check passed",
+            risk_level=RiskLevel.SAFE
+        )
+
     async def _emit_check_started(self, check_name, command, context):
         if context.event_emitter:
             from app.schemas.events import SecurityCheckStartedEvent

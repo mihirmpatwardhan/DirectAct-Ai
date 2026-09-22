@@ -1,5 +1,6 @@
 """
-Chat Routes — message persistence + LLM stub (Phase 2 will add real streaming)
+Chat Routes — message persistence + LLM stub (Phase 2 will add real streaming).
+All endpoints require JWT authentication and verify session ownership.
 """
 import uuid
 import logging
@@ -11,7 +12,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, desc
 from app.core.database import get_db
 from app.core.config import settings
-from app.models.models import Message, MessageRole, Session as SessionModel
+from app.core.auth_utils import get_current_user
+from app.models.models import Message, MessageRole, Session as SessionModel, User
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/chat", tags=["chat"])
@@ -38,19 +40,37 @@ class ChatResponse(BaseModel):
     assistant_message: MessageResponse
 
 
+async def _get_owned_session(
+    session_id: str,
+    db: AsyncSession,
+    current_user: User,
+) -> SessionModel:
+    """
+    Load a session and verify the requesting user owns it.
+    Raises HTTP 404 if not found, HTTP 403 if owned by another user.
+    """
+    sess_result = await db.execute(
+        select(SessionModel).where(SessionModel.id == session_id)
+    )
+    session = sess_result.scalar_one_or_none()
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    # FIX: prevent cross-user message reads/writes
+    if session.user_id != str(current_user.id):
+        raise HTTPException(status_code=403, detail="Access denied")
+    return session
+
+
 @router.get("/{session_id}/messages", response_model=List[MessageResponse])
 async def get_messages(
     session_id: str,
     limit: int = 50,
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
-    """Retrieve message history for a session."""
-    # Verify session exists
-    sess_result = await db.execute(
-        select(SessionModel).where(SessionModel.id == session_id)
-    )
-    if not sess_result.scalar_one_or_none():
-        raise HTTPException(status_code=404, detail="Session not found")
+    """Retrieve message history for a session — authenticated & owned by caller."""
+    # FIX: verifies ownership before loading messages
+    await _get_owned_session(session_id, db, current_user)
 
     result = await db.execute(
         select(Message)
@@ -73,18 +93,17 @@ async def get_messages(
 
 
 @router.post("/send", response_model=ChatResponse)
-async def send_message(payload: ChatRequest, db: AsyncSession = Depends(get_db)):
+async def send_message(
+    payload: ChatRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
     """
     Send a message and get a response.
-    Phase 1: Returns an echo stub. Phase 2 will wire up real LLM streaming.
+    Requires authentication and ownership of the target session.
     """
-    # Verify session
-    sess_result = await db.execute(
-        select(SessionModel).where(SessionModel.id == payload.session_id)
-    )
-    session = sess_result.scalar_one_or_none()
-    if not session:
-        raise HTTPException(status_code=404, detail="Session not found")
+    # FIX: verifies session belongs to the calling user
+    await _get_owned_session(payload.session_id, db, current_user)
 
     # Save user message
     user_msg = Message(

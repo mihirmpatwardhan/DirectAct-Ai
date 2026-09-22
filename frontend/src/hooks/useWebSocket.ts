@@ -1,160 +1,100 @@
 import { useEffect, useRef, useCallback } from 'react';
 import { useAppStore } from '../store/appStore';
-import type { WsEvent, WsStreamChunk, WsStreamEnd, WsActionUpdate, WsViewportScreenshot, WsStatus } from '../types';
+import type { WsActionUpdate, WsViewportScreenshot } from '../types';
 import type {
   TaskStartedEvent, TaskStepStartedEvent, TaskStepCompletedEvent,
   SecurityCheckResultEvent, PermissionRequestedEvent, AuditLogEntryEvent,
 } from '../types/events';
 
-const WS_URL = (sessionId: string) =>
-  `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws/${sessionId}`;
+const TOKEN_KEY = 'directact_token';
 
-const RECONNECT_DELAY_MS = 3000;
-const MAX_RECONNECT = 5;
+/**
+ * FIX: Include the JWT token as a query parameter so the server can authenticate
+ * the WebSocket connection. WebSocket API does not support custom headers, so
+ * the token must be sent in the URL (?token=<jwt>).
+ */
+const WS_URL = (sessionId: string): string => {
+  const token = localStorage.getItem(TOKEN_KEY) ?? '';
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  const tokenParam = token ? `?token=${encodeURIComponent(token)}` : '';
+  return `${proto}://${location.host}/ws/${sessionId}${tokenParam}`;
+};
+
+const BASE_RECONNECT_MS = 3000;
+const MAX_RECONNECT_MS = 30000;
 
 export function useWebSocket(sessionId: string | null) {
+  // ── Stable refs (never re-ordered, always the same number of hooks) ─────────
   const wsRef = useRef<WebSocket | null>(null);
-  const reconnectCount = useRef(0);
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const isIntentionalClose = useRef(false);
+  const reconnectAttempt = useRef(0);
+  // storeRef lets event handler always see latest state without causing re-renders
+  const storeRef = useRef(useAppStore.getState());
 
-  const {
-    setWsStatus,
-    appendStreamChunk,
-    finalizeStreamMessage,
-    addAction,
-    updateAction,
-    setIsStreaming,
-    setViewportFrame,
-    setLlmProvider,
-    setActiveTab,
-    // Typed event handlers (Phase 1.4)
-    onTaskStarted,
-    onTaskStepStarted,
-    onTaskStepCompleted,
-    onTaskCompleted,
-    onTaskFailed,
-    onSecurityCheckResult,
-    onPermissionRequested,
-    onPermissionResolved,
-    onAuditLogEntry,
-  } = useAppStore();
+  // Sync storeRef on every store change — NO deps change, just subscription
+  useEffect(() => {
+    return useAppStore.subscribe((state) => {
+      storeRef.current = state;
+    });
+  }, []);
 
-  const connect = useCallback(() => {
-    if (!sessionId) return;
-
-    if (wsRef.current && wsRef.current.readyState !== WebSocket.CLOSED) {
-      wsRef.current.close();
-    }
-
-    setWsStatus('connecting');
-    const ws = new WebSocket(WS_URL(sessionId));
-    wsRef.current = ws;
-
-    ws.onopen = () => {
-      setWsStatus('connected');
-      reconnectCount.current = 0;
-      console.log('[WS] Connected to session:', sessionId);
-    };
-
-    ws.onmessage = (event) => {
-      try {
-        const data: WsEvent = JSON.parse(event.data);
-        handleEvent(data, sessionId);
-      } catch {
-        console.error('[WS] Failed to parse message', event.data);
-      }
-    };
-
-    ws.onclose = (e) => {
-      setWsStatus('disconnected');
-      console.log('[WS] Disconnected', e.code, e.reason);
-      if (reconnectCount.current < MAX_RECONNECT) {
-        reconnectCount.current++;
-        reconnectTimer.current = setTimeout(connect, RECONNECT_DELAY_MS);
-      }
-    };
-
-    ws.onerror = () => {
-      setWsStatus('error');
-    };
-  }, [sessionId]);
-
-  const handleEvent = (event: any, sid: string) => {
+  // ── Stable callbacks (all with empty deps — they read from refs) ───────────
+  const handleEvent = useCallback((event: any, sid: string) => {
+    const s = storeRef.current;
     switch (event.type) {
-      // ── LLM Streaming (new typed names + legacy) ─────────────────────────
       case 'text_chunk':
       case 'stream_chunk': {
         const chunk = event.content ?? event.chunk ?? '';
         const msgId = event.message_id;
-        if (msgId) appendStreamChunk(sid, msgId, chunk);
-        setIsStreaming(true);
+        if (msgId) s.appendStreamChunk(sid, msgId, chunk);
+        s.setIsStreaming(true);
         break;
       }
       case 'stream_end': {
-        if (event.message_id) finalizeStreamMessage(sid, event.message_id);
-        setIsStreaming(false);
+        if (event.message_id) s.finalizeStreamMessage(sid, event.message_id);
+        s.setIsStreaming(false);
         break;
       }
-
-      // ── Task Lifecycle ────────────────────────────────────────────────────
       case 'task_started': {
         const e = event as TaskStartedEvent;
-        onTaskStarted(e.task_id, e.original_intent, e.total_steps, e.highest_risk, e.requires_any_approval);
+        s.onTaskStarted(e.task_id, e.original_intent, e.total_steps, e.highest_risk, e.requires_any_approval);
         break;
       }
-      case 'task_step_started': {
-        onTaskStepStarted(event as TaskStepStartedEvent);
+      case 'task_step_started':
+        s.onTaskStepStarted(event as TaskStepStartedEvent);
         break;
-      }
-      case 'task_step_completed': {
-        onTaskStepCompleted(event as TaskStepCompletedEvent);
+      case 'task_step_completed':
+        s.onTaskStepCompleted(event as TaskStepCompletedEvent);
         break;
-      }
-      case 'task_completed': {
-        onTaskCompleted(event.task_id);
+      case 'task_completed':
+        s.onTaskCompleted(event.task_id);
         break;
-      }
-      case 'task_failed': {
-        onTaskFailed(event.task_id, event.reason);
+      case 'task_failed':
+        s.onTaskFailed(event.task_id, event.reason);
         break;
-      }
-
-      // ── Security Pipeline ─────────────────────────────────────────────────
-      case 'security_check_result': {
-        onSecurityCheckResult(event as SecurityCheckResultEvent);
+      case 'security_check_result':
+        s.onSecurityCheckResult(event as SecurityCheckResultEvent);
         break;
-      }
-      case 'action_blocked': {
-        // Show in security tab
-        setActiveTab('security');
+      case 'action_blocked':
+        s.setActiveTab('security');
         break;
-      }
-
-      // ── Human-in-the-Loop ─────────────────────────────────────────────────
-      case 'permission_requested': {
-        onPermissionRequested(event as PermissionRequestedEvent);
-        // Tab switch handled in store
+      case 'permission_requested':
+        s.onPermissionRequested(event as PermissionRequestedEvent);
         break;
-      }
       case 'permission_granted':
-      case 'permission_denied': {
-        if (event.action_id) onPermissionResolved(event.action_id);
+      case 'permission_denied':
+        if (event.action_id) s.onPermissionResolved(event.action_id);
         break;
-      }
-
-      // ── Audit Log ─────────────────────────────────────────────────────────
-      case 'audit_log_entry': {
-        onAuditLogEntry(event as AuditLogEntryEvent);
+      case 'audit_log_entry':
+        s.onAuditLogEntry(event as AuditLogEntryEvent);
         break;
-      }
-
-      // ── Legacy action_update ──────────────────────────────────────────────
       case 'action_update': {
         const e = event as WsActionUpdate;
         if (e.action?.id) {
-          const action = e.action as Parameters<typeof addAction>[0];
+          const action = e.action as Parameters<typeof s.addAction>[0];
           if (action.id) {
-            addAction({
+            s.addAction({
               id: action.id,
               session_id: action.session_id ?? sid,
               action_type: action.action_type ?? 'system',
@@ -165,31 +105,24 @@ export function useWebSocket(sessionId: string | null) {
               requires_approval: action.requires_approval ?? false,
               created_at: action.created_at ?? new Date().toISOString(),
             });
-            if (action.status === 'awaiting_approval') {
-              setActiveTab('approvals');
-            }
+            if (action.status === 'awaiting_approval') s.setActiveTab('approvals');
           }
         }
         break;
       }
-
-      // ── Viewport ──────────────────────────────────────────────────────────
       case 'viewport_screenshot': {
         const e = event as WsViewportScreenshot;
-        setViewportFrame({ data: e.data, label: e.label, timestamp: e.timestamp });
+        s.setViewportFrame({ data: e.data, label: e.label, timestamp: e.timestamp });
         break;
       }
-
-      // ── System Status ─────────────────────────────────────────────────────
       case 'system_status':
       case 'status': {
         const details = event.details ?? event.data ?? {};
         if (details?.llm_provider) {
-          setLlmProvider(details.llm_provider as string, details.llm_ready as boolean ?? false);
+          s.setLlmProvider(details.llm_provider as string, details.llm_ready as boolean ?? false);
         }
         break;
       }
-
       case 'error_occurred':
       case 'error':
         console.error('[WS] Server error:', event.message ?? event.error, event.details);
@@ -200,7 +133,7 @@ export function useWebSocket(sessionId: string | null) {
       default:
         console.debug('[WS] Unknown event type:', event.type);
     }
-  };
+  }, []); // empty deps: storeRef keeps it current without changing identity
 
   const sendMessage = useCallback(
     (content: string, targetEngine?: 'auto' | 'web' | 'desktop') => {
@@ -213,17 +146,9 @@ export function useWebSocket(sessionId: string | null) {
     []
   );
 
-  const sendPing = useCallback(() => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({ type: 'ping' }));
-    }
-  }, []);
-
   const sendApproval = useCallback((actionId: string, approved: boolean) => {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(
-        JSON.stringify({ type: 'approval_response', action_id: actionId, approved })
-      );
+      wsRef.current.send(JSON.stringify({ type: 'approval_response', action_id: actionId, approved }));
     }
   }, []);
 
@@ -239,15 +164,96 @@ export function useWebSocket(sessionId: string | null) {
     }
   }, []);
 
+  // ── Core WebSocket lifecycle (single effect, only fires when sessionId changes) ─
   useEffect(() => {
+    if (!sessionId) return;
+
+    let destroyed = false;
+
+    function connect() {
+      if (destroyed) return;
+      if (
+        wsRef.current &&
+        (wsRef.current.readyState === WebSocket.OPEN ||
+          wsRef.current.readyState === WebSocket.CONNECTING)
+      ) return;
+
+      storeRef.current.setWsStatus('connecting');
+      // FIX: WS_URL now includes ?token=<jwt> for server-side authentication
+      const ws = new WebSocket(WS_URL(sessionId!));
+      wsRef.current = ws;
+
+      ws.onopen = () => {
+        if (destroyed) { ws.close(); return; }
+        reconnectAttempt.current = 0;
+        storeRef.current.setWsStatus('connected');
+        console.log('[WS] Connected:', sessionId);
+      };
+
+      ws.onmessage = (ev) => {
+        if (destroyed) return;
+        try {
+          handleEvent(JSON.parse(ev.data), sessionId!);
+        } catch {
+          console.error('[WS] Parse error', ev.data);
+        }
+      };
+
+      ws.onclose = (e) => {
+        if (destroyed) return;
+        storeRef.current.setWsStatus('disconnected');
+        if (isIntentionalClose.current) { isIntentionalClose.current = false; return; }
+
+        // FIX: if server rejected with auth error (4001), do not retry
+        if (e.code === 4001) {
+          console.error('[WS] Authentication failed — token invalid or missing. Not retrying.');
+          storeRef.current.setWsStatus('error');
+          return;
+        }
+        // FIX: if server rejected with access denied (4003 / 4004), do not retry
+        if (e.code === 4003 || e.code === 4004) {
+          console.error('[WS] Access denied or session not found. Not retrying.');
+          storeRef.current.setWsStatus('error');
+          return;
+        }
+
+        console.log('[WS] Disconnected:', e.code, e.reason);
+        // Exponential back-off: 3s → 4.5s → 6.75s … capped at 30s
+        const delay = Math.min(
+          BASE_RECONNECT_MS * Math.pow(1.5, reconnectAttempt.current),
+          MAX_RECONNECT_MS
+        );
+        reconnectAttempt.current += 1;
+        if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
+        reconnectTimer.current = setTimeout(connect, delay);
+      };
+
+      ws.onerror = () => {
+        if (destroyed) return;
+        storeRef.current.setWsStatus('error');
+        // onclose fires after onerror → reconnect scheduled there
+      };
+    }
+
     connect();
-    const heartbeat = setInterval(sendPing, 25000);
+
+    const heartbeat = setInterval(() => {
+      if (wsRef.current?.readyState === WebSocket.OPEN) {
+        wsRef.current.send(JSON.stringify({ type: 'ping' }));
+      }
+    }, 25000);
+
     return () => {
+      destroyed = true;
       clearInterval(heartbeat);
       if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
-      wsRef.current?.close();
+      if (wsRef.current) {
+        isIntentionalClose.current = true;
+        wsRef.current.close();
+        wsRef.current = null;
+      }
     };
-  }, [connect, sendPing]);
+  }, [sessionId, handleEvent]); // handleEvent has stable identity (empty deps)
 
   return { sendMessage, sendApproval, sendBrowserStart, sendBrowserClose };
 }

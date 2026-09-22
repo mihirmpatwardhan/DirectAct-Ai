@@ -9,17 +9,18 @@ import { fetchMessages, createSession } from '../../lib/api';
 import type { Message } from '../../types';
 
 const SUGGESTIONS = [
-  { icon: '🌐', text: 'Open google.com and search for AI news' },
-  { icon: '📁', text: 'Open File Explorer' },
-  { icon: '📊', text: 'Open Notepad and write a task list' },
-  { icon: '🔍', text: 'Search YouTube for a tutorial' },
+  { icon: '🌐', text: 'Navigate to a website and extract information' },
+  { icon: '💻', text: 'Launch an application and perform a workflow' },
+  { icon: '📁', text: 'Organize files and folders in directory' },
+  { icon: '🔍', text: 'Search the web or stream content' },
 ];
 
 interface ChatPanelProps {
   sessionId: string | null;
+  sendMessage: (content: string, targetEngine?: 'auto' | 'web' | 'desktop') => void;
 }
 
-export const ChatPanel: React.FC<ChatPanelProps> = ({ sessionId }) => {
+export const ChatPanel: React.FC<ChatPanelProps> = ({ sessionId, sendMessage }) => {
   const [input, setInput] = useState('');
   const [targetEngine, setTargetEngine] = useState<'auto' | 'web' | 'desktop'>('auto');
   const [isSending, setIsSending] = useState(false);
@@ -27,7 +28,6 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({ sessionId }) => {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   const { messages, addMessage, setMessages, isStreaming, addSession, setActiveSession } = useAppStore();
-  const { sendMessage: wsSend } = useWebSocket(sessionId);
 
   const sessionMessages: Message[] = sessionId ? (messages[sessionId] ?? []) : [];
 
@@ -78,11 +78,11 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({ sessionId }) => {
     setIsSending(true);
     try {
       // Send via WebSocket with targetEngine
-      wsSend(content, targetEngine);
+      sendMessage(content, targetEngine);
     } finally {
       setIsSending(false);
     }
-  }, [input, sessionId, isSending, targetEngine, addMessage, wsSend, addSession, setActiveSession]);
+  }, [input, sessionId, isSending, targetEngine, addMessage, sendMessage, addSession, setActiveSession]);
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === 'Enter' && !e.shiftKey) {

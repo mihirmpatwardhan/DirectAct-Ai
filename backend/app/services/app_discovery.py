@@ -22,6 +22,7 @@ import logging
 import os
 import platform
 import sqlite3
+import subprocess
 import time
 from dataclasses import dataclass, asdict
 from enum import Enum
@@ -58,6 +59,7 @@ class InstalledApplication:
     install_location: Optional[str] = None
     is_default_handler_for: List[str] = None  # e.g. ["http", "https", ".html"]
     os_family: str = "windows"
+    app_user_model_id: Optional[str] = None  # Windows Start Menu / PWA / Store AppID
 
     def __post_init__(self):
         if self.is_default_handler_for is None:
@@ -113,9 +115,14 @@ def _init_cache_db(db_path: str) -> sqlite3.Connection:
             install_location TEXT,
             is_default_handler_for TEXT,
             os_family TEXT,
+            app_user_model_id TEXT,
             scanned_at REAL
         )
     """)
+    # Migrate older caches that predate app_user_model_id
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(app_inventory)")}
+    if "app_user_model_id" not in cols:
+        conn.execute("ALTER TABLE app_inventory ADD COLUMN app_user_model_id TEXT")
     conn.commit()
     return conn
 
@@ -126,13 +133,13 @@ def _cache_apps(apps: List[InstalledApplication], db_path: str):
     conn.execute("DELETE FROM app_inventory")
     for app in apps:
         conn.execute(
-            "INSERT OR REPLACE INTO app_inventory VALUES (?,?,?,?,?,?,?,?,?,?)",
+            "INSERT OR REPLACE INTO app_inventory VALUES (?,?,?,?,?,?,?,?,?,?,?)",
             (
                 app.canonical_id, app.name, app.executable_path,
                 app.version, app.category.value, app.publisher,
                 app.install_location,
                 json.dumps(app.is_default_handler_for),
-                app.os_family, now,
+                app.os_family, app.app_user_model_id, now,
             )
         )
     conn.commit()
@@ -146,7 +153,15 @@ def _load_cached(db_path: str) -> Optional[List[InstalledApplication]]:
     try:
         conn = sqlite3.connect(db_path)
         row = conn.execute("SELECT scanned_at FROM app_inventory LIMIT 1").fetchone()
-        if not row or (time.time() - row[0]) > _CACHE_TTL:
+        if not row:
+            conn.close()
+            return None
+        try:
+            scanned_at = float(row[0])
+        except (TypeError, ValueError):
+            conn.close()
+            return None
+        if (time.time() - scanned_at) > _CACHE_TTL:
             conn.close()
             return None
         rows = conn.execute("SELECT * FROM app_inventory").fetchall()
@@ -159,6 +174,7 @@ def _load_cached(db_path: str) -> Optional[List[InstalledApplication]]:
                 install_location=r[6],
                 is_default_handler_for=json.loads(r[7] or "[]"),
                 os_family=r[8],
+                app_user_model_id=(r[9] if len(r) > 9 else None),
             ))
         return apps
     except Exception as e:
@@ -170,24 +186,77 @@ def _load_cached(db_path: str) -> Optional[List[InstalledApplication]]:
 # Windows Scanner
 # ──────────────────────────────────────────────────────────────────────────────
 
+def _scan_windows_start_apps() -> List[tuple[str, str]]:
+    """Return (display_name, AppID) pairs from the Windows Start Menu."""
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+             "Get-StartApps | ConvertTo-Json -Compress"],
+            capture_output=True, text=True, timeout=45,
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            return []
+        data = json.loads(result.stdout)
+        if isinstance(data, dict):
+            data = [data]
+        pairs: List[tuple[str, str]] = []
+        for item in data:
+            name = (item.get("Name") or "").strip()
+            app_id = (item.get("AppID") or "").strip()
+            if name and app_id:
+                pairs.append((name, app_id))
+        return pairs
+    except Exception as e:
+        logger.warning(f"AppDiscovery: Get-StartApps scan failed: {e}")
+        return []
+
+
 def _scan_windows() -> List[InstalledApplication]:
     apps: List[InstalledApplication] = []
     seen: set = set()
 
-    def _add(name: str, exe: Optional[str], version: Optional[str], publisher: Optional[str],
-              install_loc: Optional[str]):
+    def _add(
+        name: str,
+        exe: Optional[str] = None,
+        version: Optional[str] = None,
+        publisher: Optional[str] = None,
+        install_loc: Optional[str] = None,
+        app_user_model_id: Optional[str] = None,
+        *,
+        prefer: bool = False,
+    ):
         cid = _make_canonical_id(name)
-        if cid in seen:
+        if cid in seen and not prefer:
             return
         seen.add(cid)
+
+        # Upgrade an existing registry-only entry when Start Menu has a launchable AppID.
+        if prefer:
+            for i, existing in enumerate(apps):
+                if existing.canonical_id == cid:
+                    apps[i] = InstalledApplication(
+                        name=name, canonical_id=cid,
+                        executable_path=exe or existing.executable_path,
+                        version=version or existing.version,
+                        category=_classify(name),
+                        publisher=publisher or existing.publisher,
+                        install_location=install_loc or existing.install_location,
+                        os_family="windows",
+                        app_user_model_id=app_user_model_id or existing.app_user_model_id,
+                    )
+                    return
+
         apps.append(InstalledApplication(
             name=name, canonical_id=cid,
             executable_path=exe, version=version,
             category=_classify(name), publisher=publisher,
             install_location=install_loc, os_family="windows",
+            app_user_model_id=app_user_model_id,
         ))
 
-    # 1. Registry Uninstall keys
+    # 0. Start Menu / PWA / Microsoft Store apps (most reliable for PWAs like YouTube)
+    for name, app_id in _scan_windows_start_apps():
+        _add(name=name, app_user_model_id=app_id, prefer=True)
     try:
         import winreg
         for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
@@ -224,29 +293,45 @@ def _scan_windows() -> List[InstalledApplication]:
     except ImportError:
         logger.debug("winreg not available — skipping registry scan")
 
-    # 2. App Paths for executables not in Uninstall
+    # 2. App Paths for executables not in Uninstall (HKLM and HKCU)
     try:
         import winreg
-        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
-                            r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths") as root:
-            i = 0
-            while True:
-                try:
-                    name = winreg.EnumKey(root, i)
-                    with winreg.OpenKey(root, name) as sub:
+        for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+            try:
+                with winreg.OpenKey(hive, r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths") as root:
+                    i = 0
+                    while True:
                         try:
-                            exe_path = winreg.QueryValue(sub, "")
-                            app_name = name.replace(".exe", "")
-                            if exe_path and os.path.exists(exe_path):
-                                _add(name=app_name, exe=exe_path, version=None,
-                                     publisher=None, install_loc=None)
-                        except Exception:
-                            pass
-                    i += 1
-                except OSError:
-                    break
+                            name = winreg.EnumKey(root, i)
+                            with winreg.OpenKey(root, name) as sub:
+                                try:
+                                    exe_path = winreg.QueryValue(sub, "")
+                                    app_name = name.replace(".exe", "")
+                                    if exe_path and os.path.exists(exe_path):
+                                        _add(name=app_name, exe=exe_path, version=None,
+                                             publisher=None, install_loc=None)
+                                except Exception:
+                                    pass
+                            i += 1
+                        except OSError:
+                            break
+            except Exception:
+                pass
     except Exception:
         pass
+
+    # 3. Start Menu shortcut (.lnk) directories
+    shortcut_dirs = [
+        os.path.expandvars(r"%APPDATA%\Microsoft\Windows\Start Menu\Programs"),
+        os.path.expandvars(r"%ProgramData%\Microsoft\Windows\Start Menu\Programs"),
+    ]
+    for sdir in shortcut_dirs:
+        if os.path.isdir(sdir):
+            for root_dir, _, files in os.walk(sdir):
+                for f in files:
+                    if f.lower().endswith(".lnk"):
+                        app_name = os.path.splitext(f)[0]
+                        _add(name=app_name)
 
     logger.info(f"AppDiscovery (Windows): found {len(apps)} apps")
     return apps
@@ -350,18 +435,43 @@ class AppDiscoveryService:
         """Find the best-matching app for a given name (fuzzy)."""
         lower = name.lower().strip()
         apps = self.get_all()
+        search_names = {lower}
+        if lower.endswith(" app"):
+            search_names.add(lower[:-4].strip())
 
-        # Exact canonical match
-        for app in apps:
+        def _score(app: InstalledApplication) -> int:
+            score = 0
+            if app.app_user_model_id:
+                score += 4
+            if app.executable_path and app.executable_path.lower().endswith(".exe"):
+                score += 3
             if app.canonical_id == lower or app.name.lower() == lower:
-                return app
+                score += 5
+            elif any(term in app.canonical_id or term in app.name.lower() for term in search_names):
+                score += 2
+            elif lower in app.canonical_id or lower in app.name.lower():
+                score += 2
+            return score
+
+        candidates: List[InstalledApplication] = []
+
+        # Exact canonical / display name
+        for app in apps:
+            if app.canonical_id in search_names or app.name.lower() in search_names:
+                candidates.append(app)
 
         # Substring match
-        for app in apps:
-            if lower in app.canonical_id or lower in app.name.lower():
-                return app
+        if not candidates:
+            for app in apps:
+                if any(term in app.canonical_id or term in app.name.lower() for term in search_names):
+                    candidates.append(app)
+                elif lower in app.canonical_id or lower in app.name.lower():
+                    candidates.append(app)
 
-        return None
+        if not candidates:
+            return None
+
+        return max(candidates, key=_score)
 
     def get_by_category(self, category: AppCategory) -> List[InstalledApplication]:
         return [a for a in self.get_all() if a.category == category]
@@ -370,7 +480,9 @@ class AppDiscoveryService:
         """Return a simplified list for the UI sidebar."""
         return [
             {"name": a.name, "canonical_id": a.canonical_id,
-             "category": a.category.value, "has_executable": bool(a.executable_path)}
+             "category": a.category.value,
+             "has_executable": bool(a.executable_path),
+             "has_app_id": bool(a.app_user_model_id)}
             for a in self.get_all()
         ]
 

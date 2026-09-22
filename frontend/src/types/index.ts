@@ -60,6 +60,7 @@ export type WsEventType =
   | 'status'
   | 'action_update'
   | 'viewport_screenshot'
+  | 'desktop_agent_step'
   | 'error'
   | 'pong'
   | 'ack';

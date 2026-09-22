@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Globe, Monitor, Terminal, ExternalLink, RefreshCw, Maximize2 } from 'lucide-react';
+import { Globe, Monitor, Terminal, RefreshCw } from 'lucide-react';
 import { useAppStore } from '../../store/appStore';
 
 export const ViewportPanel: React.FC = () => {
@@ -10,14 +10,19 @@ export const ViewportPanel: React.FC = () => {
   const displayFrame = activeView === 'history' && viewportHistory.length > 0
     ? viewportHistory[historyIdx]
     : viewportFrame;
+  const isDesktopFrame = Boolean(displayFrame?.label.toLowerCase().includes('desktop'));
 
   return (
     <div className="viewport-panel">
       {/* Header */}
       <div className="viewport-header">
-        <Globe size={14} style={{ color: 'var(--accent-tertiary)' }} />
+        {isDesktopFrame ? (
+          <Monitor size={14} style={{ color: 'var(--accent-secondary)' }} />
+        ) : (
+          <Globe size={14} style={{ color: 'var(--accent-tertiary)' }} />
+        )}
         <span style={{ fontSize: 12, color: 'var(--text-secondary)', fontWeight: 600 }}>
-          Live Viewport
+          {isDesktopFrame ? 'Live Desktop' : 'Live Browser'}
         </span>
         {isStreaming && (
           <span style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 11, color: 'var(--accent-tertiary)' }}>
@@ -203,7 +208,7 @@ const LiveScreenshot: React.FC<{ frame: { data: string; label: string; timestamp
 );
 
 const ViewportPlaceholder: React.FC<{ message?: string }> = ({
-  message = 'Browser viewport will stream here during web automation',
+  message = 'Browser or desktop screenshots will stream here during automation',
 }) => (
   <div className="viewport-placeholder" style={{ height: '100%' }}>
     <div className="viewport-placeholder-icon" style={{
@@ -238,7 +243,7 @@ const CapabilityBadge: React.FC<{ icon: string; label: string; color: string }> 
     fontSize: 11,
     color: 'var(--text-muted)',
   }}>
-    <span>{icon}</span>
+    <span style={{ color }}>{icon}</span>
     <span>{label}</span>
   </div>
 );
