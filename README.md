@@ -1,287 +1,264 @@
 <div align="center">
-  <h1>⚡ DirectAct-AI</h1>
-  <p><strong>Turn natural language into real desktop & web actions — with a built-in AI security firewall.</strong></p>
 
-  <p>
-    <img src="https://img.shields.io/badge/Python-3.10+-3776AB?style=for-the-badge&logo=python&logoColor=white"/>
-    <img src="https://img.shields.io/badge/FastAPI-009688?style=for-the-badge&logo=fastapi&logoColor=white"/>
-    <img src="https://img.shields.io/badge/React_19-20232A?style=for-the-badge&logo=react&logoColor=61DAFB"/>
-    <img src="https://img.shields.io/badge/TypeScript-3178C6?style=for-the-badge&logo=typescript&logoColor=white"/>
-    <img src="https://img.shields.io/badge/Playwright-2EAD33?style=for-the-badge&logo=playwright&logoColor=white"/>
-    <img src="https://img.shields.io/badge/Windows-0078D6?style=for-the-badge&logo=windows&logoColor=white"/>
-  </p>
+<br/>
 
-  <p>
-    <a href="#-quick-start">🚀 Quick Start</a> •
-    <a href="#-architecture">🏗 Architecture</a> •
-    <a href="#-how-it-works">⚙️ How It Works</a> •
-    <a href="#-security">🔒 Security</a> •
-    <a href="#%EF%B8%8F-configuration">🛠️ Config</a>
-  </p>
+# ⚡ DirectAct-AI
+
+**The only AI agent with a built-in security firewall.**
+
+*Type a goal. Watch it happen. Nothing runs without your trust.*
+
+<br/>
+
+[![Python](https://img.shields.io/badge/Python_3.10+-black?style=flat-square&logo=python)](https://python.org)
+[![FastAPI](https://img.shields.io/badge/FastAPI-black?style=flat-square&logo=fastapi)](https://fastapi.tiangolo.com)
+[![React](https://img.shields.io/badge/React_19-black?style=flat-square&logo=react)](https://react.dev)
+[![TypeScript](https://img.shields.io/badge/TypeScript-black?style=flat-square&logo=typescript)](https://typescriptlang.org)
+[![Playwright](https://img.shields.io/badge/Playwright-black?style=flat-square&logo=playwright)](https://playwright.dev)
+[![License MIT](https://img.shields.io/badge/License-MIT-black?style=flat-square)](LICENSE)
+
+<br/>
+
+[**Get Started →**](#-quick-start) · [**Architecture →**](#-architecture) · [**Security →**](#-security-model)
+
+<br/>
+
 </div>
 
 ---
 
-## 💡 What Is DirectAct-AI?
+## The Problem
 
-DirectAct-AI is an **autonomous AI agent** that listens to what you want in plain English and performs the action on your computer — across websites and desktop apps — safely.
+Every AI agent today does the same dangerous thing — takes your instruction, generates a shell script, and runs it directly on your machine. No checks. No filters. No asking.
+
+One bad prompt. One hallucination. Your files are gone.
+
+---
+
+## The Solution
+
+DirectAct-AI puts a **deterministic 8-stage security firewall** between the AI's plan and your operating system. The LLM is only allowed to *plan* — it never touches your OS directly.
 
 ```
-You say  →  "Find cheapest flight from Mumbai to Delhi next week and tell me the price"
-AI does  →  Opens browser → Navigates to Google Flights → Fills form → Reads results → Reports back
-You see  →  Every step, live, in your browser dashboard
+Your Goal  →  AI Plan  →  [ 8-Stage Guard ]  →  Execute  →  Watch Live
+                              ↑
+                     (not the LLM — pure logic,
+                      regex, antivirus, & you)
 ```
 
-Unlike other AI agents that blindly run code, DirectAct-AI runs **every action through an 8-stage security checkpoint** before touching your system. Risky actions pause and ask for your approval.
+Every step is verified, every action is audited, and anything risky **pauses and asks you first**.
 
 ---
 
 ## 🏗 Architecture
 
 ```mermaid
-flowchart TD
-    A(["👤 You\n(Dashboard / Chat)"]):::user
+graph TD
+    User(["👤 You"])
 
-    subgraph FE["🖥️ Frontend — React 19 + TypeScript"]
-        B["Chat Panel\n(Type your goal)"]
-        C["Live Viewport\n(Watch it happen)"]
-        D["Timeline & Audit\n(See every step)"]
+    subgraph Frontend["Frontend · React 19 + TypeScript + Zustand"]
+        Chat["💬 Chat Panel"]
+        Live["📺 Live Viewport"]
+        Audit["🕐 Timeline & Audit"]
     end
 
-    subgraph BE["⚡ Backend — FastAPI + Python"]
-        E["Task Router\n(Fast regex → LLM fallback)"]
-        F["Saga Orchestrator\n(Breaks goal → steps)"]
-        G["Gemini / OpenAI\n(AI Planner)"]
+    subgraph Backend["Backend · FastAPI + AsyncIO"]
+        Router["⚡ Task Router"]
+        LLM["🤖 AI Planner\nGemini 2.0 / GPT-4o"]
+        Orch["🔄 Saga Orchestrator"]
     end
 
-    subgraph SEC["🛡️ 8-Stage Security Guard"]
-        S1["① Regex Deny List"]
-        S2["② Static Code Analysis"]
-        S3["③ Privilege Check"]
-        S4["④ AMSI Antivirus Scan"]
-        S5["⑤ Sandbox Decision"]
-        S6["⑥ Directory Whitelist"]
-        S7["⑦ Human Approval Gate"]
-        S8["⑧ Hash-Chain Audit Log"]
-        S1 --> S2 --> S3 --> S4 --> S5 --> S6 --> S7 --> S8
+    subgraph Guard["🛡️ 8-Stage Security Guard · 100% Deterministic · Non-LLM"]
+        G1["① Regex Deny List"]
+        G2["② Static Analysis"]
+        G3["③ Privilege Check"]
+        G4["④ AMSI Antivirus"]
+        G5["⑤ Sandbox Gate"]
+        G6["⑥ Dir Whitelist"]
+        G7["⑦ Human Approval"]
+        G8["⑧ Audit Hash-Chain"]
+        G1 --> G2 --> G3 --> G4 --> G5 --> G6 --> G7 --> G8
     end
 
-    subgraph ENG["⚙️ Execution Engines"]
-        E1["💻 Windows OS Engine\n(PowerShell 7, Win32)"]
-        E2["🌐 Playwright Browser\n(Chromium, headless/headed)"]
-        E3["🧩 Live Chrome Bridge\n(Your real signed-in Chrome)"]
+    subgraph Engines["Execution Engines"]
+        OS["💻 Windows Engine\nPowerShell 7 · Win32"]
+        Web["🌐 Playwright\nChromium Browser"]
+        Bridge["🧩 Chrome Bridge\nYour Real Chrome"]
     end
 
-    DB[("📦 SQLite DB\nSessions • Messages • Actions")]
-    VLT[("🔐 Encrypted Vault\nAES-256-GCM Personal Data")]
-    LOG[("📜 Audit Ledger\nSHA-256 Hash-Chain Log")]
+    subgraph Storage["Persistence"]
+        DB[("🗄 SQLite\nSessions & Logs")]
+        Vault[("🔐 Encrypted Vault\nAES-256-GCM")]
+        Chain[("📜 Audit Ledger\nSHA-256 Hash-Chain")]
+    end
 
-    A -->|Types goal| B
-    B -->|WebSocket / REST| E
-    E --> F
-    F <--> G
-    F --> SEC
-    SEC -->|✅ PASS| ENG
-    SEC -->|❌ BLOCK| LOG
-    ENG --> DB & LOG
-    ENG -->|Live frames| C
-    F -->|Events| D
-    E1 -.->|Personal data| VLT
-
-    classDef user fill:#6366f1,color:#fff,stroke:none
-    classDef block fill:#ef4444,color:#fff,stroke:none
+    User -->|types goal| Chat
+    Chat <-->|WebSocket| Backend
+    Router --> LLM --> Orch
+    Orch --> Guard
+    Guard -->|✅ PASS| Engines
+    Guard -->|❌ BLOCK| Chain
+    Engines -->|live frames| Live
+    Engines --> Storage
+    Orch -->|step events| Audit
 ```
 
 ---
 
-## ⚙️ How It Works
+## ✨ Features
 
-### Step-by-Step Flow
-
-| Step | What Happens |
-|------|-------------|
-| **1. You type a goal** | Natural language — no code needed |
-| **2. Task Router** | Classifies intent in <5ms (regex). Falls back to LLM if ambiguous |
-| **3. AI Planner** | Gemini/OpenAI breaks the goal into typed action steps (not raw code) |
-| **4. Security Guard** | Each step passes through 8 deterministic safety stages |
-| **5. Execution** | Approved steps run on OS engine or browser engine |
-| **6. Live stream** | You watch the browser/desktop live in the viewport panel |
-| **7. Audit log** | Every decision is permanently hash-chained and stored |
-
-### The Two Execution Modes
-
-```
-Mode 1 — Playwright Browser (Isolated)
-  ├── Opens a fresh Chromium window
-  ├── Highlights elements with a red outline before clicking
-  └── Streams live screenshots to your dashboard
-
-Mode 2 — Live Chrome Bridge (Your Chrome)
-  ├── Chrome Extension connects via chrome.debugger API
-  ├── Works inside your real signed-in session (Gmail, GitHub…)
-  └── Never reads your passwords or cookies
-```
+- **🔒 Zero raw code execution** — LLM outputs structured typed schemas, never shell scripts
+- **🛡️ 8-stage security guard** — deterministic pipeline catches threats before they reach your OS
+- **👁️ Live viewport streaming** — watch the browser operate in real time from your dashboard
+- **🧩 Live Chrome Bridge** — control your real signed-in Chrome via CDP, no cookie theft
+- **💻 Native Windows automation** — PowerShell 7, Win32 APIs, app registry, GDI screenshots
+- **🔄 Saga rollback** — multi-step goals roll back cleanly if a step fails midway
+- **⚡ LLM Circuit Breaker** — auto-rotates API keys on rate limits, zero downtime
+- **🔐 Encrypted identity vault** — AES-256-GCM, master key lives only in your OS Keychain
+- **📜 Tamper-proof audit log** — SHA-256 hash-chained JSONL — history cannot be edited
+- **👥 Multi-user auth** — JWT sessions, bcrypt passwords, strict per-user data isolation
 
 ---
 
-## 🔒 Security
+## 🛡️ Security Model
 
-DirectAct-AI's core principle: **the LLM never touches your OS directly.**
+### How the 8-Stage Guard Works
 
-```
-LLM Output  →  Typed Schema Actions  →  8-Stage Guard  →  OS / Browser
-             (not raw shell scripts)    (deterministic)
-```
-
-### The 8-Stage Guard — What Each Stage Blocks
-
-| # | Stage | Blocks |
-|---|-------|--------|
-| **①** | Policy Deny List | `rm -rf`, `format C:`, `shutdown`, `del /s`, PowerShell bypasses |
-| **②** | Static Analysis | Hidden windows, obfuscated payloads, download cradles |
-| **③** | Privilege Check | `sudo`, `runas`, `net localgroup administrators` |
-| **④** | AMSI Antivirus | Every script scanned by Windows Defender in-memory |
-| **⑤** | Sandbox Decision | Unknown executables routed to Windows Sandbox VM |
-| **⑥** | Directory Whitelist | No writes to `C:\Windows`, `C:\Program Files`, system dirs |
-| **⑦** | Human Approval | **YOU** click Approve/Decline for any medium-high risk action |
-| **⑧** | Audit Log | SHA-256 hash-chained — modifying history breaks the chain |
+| Stage | Name | What It Blocks |
+|:---:|---|---|
+| **①** | Regex Deny List | `rm -rf` `format c:` `shutdown` `del /s` PowerShell bypasses |
+| **②** | Static Analysis | Hidden windows, obfuscated payloads, certutil/bitsadmin cradles |
+| **③** | Privilege Check | `sudo` `runas` `net localgroup administrators` — any silent elevation |
+| **④** | AMSI Antivirus | Native Windows Defender in-memory scan on every script buffer |
+| **⑤** | Sandbox Gate | Unknown executables routed into Windows Sandbox disposable VM |
+| **⑥** | Directory Whitelist | Writes blocked outside User home, `%TEMP%`, and your workspace |
+| **⑦** | Human Approval | **You** get an Approve / Decline card for any medium-high risk action |
+| **⑧** | Audit Hash-Chain | SHA-256 linked log written permanently — altering it breaks the chain |
 
 ### Encrypted Personal Vault
 
-Your personal data (name, email, address) is stored in an AES-256-GCM encrypted vault. The master key lives **only in your OS Keychain** — never written to disk.
+> The master key is generated once and stored in your **OS Keychain**. It never touches a file or database.
 
-| Data Tier | Examples | Access |
-|-----------|----------|--------|
-| Routine | Name, preferences | Auto-approved |
-| Contextual | Email, phone, address | Approved if task purpose matches |
-| Identity | ID references | Requires explicit confirmation every time |
-| **Forbidden** | Passwords, credit cards, CVVs | **Hard blocked at write time** |
+| Tier | Data | Access Rule |
+|---|---|---|
+| Routine | Name, language, preferences | Auto-approved |
+| Contextual | Email, phone, address | Approved when task purpose matches |
+| Identity | Document references | Manual confirmation required every single time |
+| **Forbidden** | Passwords · Credit cards · CVVs · SSNs | **Hard-blocked at write time — forever** |
 
 ---
 
 ## 🚀 Quick Start
 
-### Prerequisites
-- Windows 10 / 11
-- Python 3.10+
-- Node.js 18+
-
-### One Command
+> **One command. That's it.**
 
 ```powershell
 .\start.ps1
 ```
 
-> Automatically installs dependencies, sets up `.env`, installs Playwright, and starts both servers.
+Installs everything, creates your `.env`, downloads Playwright's browser, and launches both servers.
 
-| | URL |
+| Service | URL |
 |---|---|
-| 🖥️ Dashboard | http://localhost:5173 |
-| 📖 API Docs | http://localhost:8000/docs |
-
----
-
-### Manual Setup
+| Dashboard | http://localhost:5173 |
+| API & Docs | http://localhost:8000/docs |
 
 <details>
-<summary><strong>Click to expand manual steps</strong></summary>
+<summary>Manual setup (click to expand)</summary>
 
 **Backend**
 ```powershell
 cd backend
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
+python -m venv .venv && .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 python -m playwright install chromium
-copy .env.example .env
-# Open .env and add your GEMINI_API_KEY
+copy .env.example .env     # then add GEMINI_API_KEY
 uvicorn app.main:app --port 8000 --reload
 ```
 
 **Frontend** (new terminal)
 ```powershell
 cd frontend
-npm install
-npm run dev
+npm install && npm run dev
 ```
+
+</details>
+
+<details>
+<summary>Chrome Extension setup (live session mode)</summary>
+
+Lets DirectAct-AI operate inside your real signed-in Chrome (Gmail, GitHub, etc.):
+
+1. Chrome → `chrome://extensions` → turn on **Developer mode**
+2. **Load unpacked** → select the `chrome-extension/` folder
+3. Check: `http://localhost:8000/api/v1/chrome/bridge-status` → `"connected": true` ✅
 
 </details>
 
 ---
 
-### 🧩 Chrome Extension (Live Mode Setup)
-
-Control your real Chrome session (useful for sites where you're already logged in):
-
-1. Open Chrome → `chrome://extensions`
-2. Enable **Developer mode** (top right)
-3. Click **Load unpacked** → select the `chrome-extension/` folder
-4. Visit `http://localhost:8000/api/v1/chrome/bridge-status` → confirm `"connected": true`
-
----
-
-## 🛠️ Configuration
-
-Edit `backend/.env` (copy from `.env.example`):
+## ⚙️ Configuration
 
 ```env
-# Required
-GEMINI_API_KEY=your_key_here     # Get free at aistudio.google.com
+# backend/.env  (copy from .env.example — never commit this file)
 
-# Optional
-OPENAI_API_KEY=sk-...            # Fallback LLM provider
-LLM_PROVIDER=gemini              # "gemini" or "openai"
-SECRET_KEY=change-in-production  # JWT signing secret
-BROWSER_HEADLESS=false           # true = browser runs invisible
+GEMINI_API_KEY=your_key_here        # Required · aistudio.google.com (free)
+LLM_PROVIDER=gemini                 # or "openai"
+OPENAI_API_KEY=optional             # Fallback if Gemini hits quota
+SECRET_KEY=change-in-production     # JWT signing secret
+BROWSER_HEADLESS=false              # false = you watch it · true = invisible
 ```
-
-> ⚠️ `.env` is in `.gitignore` — your keys are never committed.
 
 ---
 
-## 📁 Project Structure
+## 📁 Codebase Map
 
 ```
 DirectAct-AI/
-├── 🖥️  frontend/               React 19 + TypeScript UI
-│       └── src/
-│           ├── components/      Chat, Timeline, Viewport, Sidebar
-│           ├── pages/           Landing, Login, Signup
-│           └── store/           Zustand state management
 │
-├── ⚡  backend/                FastAPI Python server
-│       └── app/
-│           ├── api/             REST + WebSocket routes
-│           └── services/
-│               ├── security_guard.py   ← 8-stage guard
-│               ├── orchestrator.py     ← goal → step executor
-│               ├── os_engine.py        ← Windows automation
-│               ├── web_engine.py       ← Playwright browser
-│               ├── llm_service.py      ← Gemini / OpenAI
-│               └── vault_service.py    ← encrypted personal data
+├── frontend/src/
+│   ├── components/       ChatPanel · Timeline · Viewport · Sidebar
+│   ├── pages/            Landing · Login · Signup
+│   ├── store/            appStore · authStore (Zustand + Immer)
+│   └── hooks/            useWebSocket.ts — real-time connection
 │
-├── 🧩  chrome-extension/       Live Chrome bridge (Manifest V3)
-├── 📋  policies/               OPA Rego security rules
-└── 🚀  start.ps1               One-click Windows launcher
+├── backend/app/
+│   ├── api/routes/       auth · sessions · chat · actions · chrome
+│   └── services/
+│       ├── security_guard.py    ← The 8-stage firewall
+│       ├── orchestrator.py      ← Goal → steps → rollback
+│       ├── os_engine.py         ← PowerShell + Win32
+│       ├── web_engine.py        ← Playwright browser
+│       ├── live_chrome_bridge.py← CDP Chrome bridge
+│       ├── llm_service.py       ← Gemini/OpenAI + circuit breaker
+│       ├── vault_service.py     ← AES-256 encrypted data
+│       └── audit_log.py         ← SHA-256 hash-chain logger
+│
+├── chrome-extension/     Manifest V3 · chrome.debugger bridge
+├── policies/             OPA Rego security rules
+└── start.ps1             One-click launcher
 ```
 
 ---
 
-## 🧰 Tech Stack
+## 🧰 Stack
 
-| Layer | Technology |
-|-------|-----------|
-| Frontend | React 19, TypeScript, Vite 8, Tailwind CSS 4, Zustand |
-| Backend | Python 3.10, FastAPI, AsyncIO, SQLAlchemy 2.0 Async |
-| AI | Google Gemini 2.0 Flash · OpenAI GPT-4o (Circuit Breaker failover) |
-| Browser | Playwright Chromium · Chrome DevTools Protocol (CDP) |
-| OS | PowerShell 7 · Win32 APIs · pywinauto |
-| Security | Windows AMSI · Open Policy Agent (OPA) · AES-256-GCM |
-| Database | SQLite (async) · SHA-256 hash-chained JSONL audit ledger |
+| | Technology |
+|---|---|
+| **Frontend** | React 19 · TypeScript · Vite · Tailwind CSS · Zustand |
+| **Backend** | Python 3.10 · FastAPI · AsyncIO · SQLAlchemy 2.0 |
+| **AI Models** | Gemini 2.0 Flash · OpenAI GPT-4o · Circuit Breaker key rotation |
+| **Browser** | Playwright Chromium · Chrome DevTools Protocol (CDP) |
+| **OS Layer** | PowerShell 7 · Win32 APIs · pywinauto · psutil |
+| **Security** | Windows AMSI · Open Policy Agent (Rego) · AES-256-GCM · bcrypt |
+| **Storage** | SQLite async · SHA-256 hash-chained JSONL |
 
 ---
 
 <div align="center">
-  <p>Built with ❤️ by <a href="https://github.com/mihirmpatwardhan"><strong>Mihir M. Patwardhan</strong></a></p>
-  <p><sub>MIT License</sub></p>
+<br/>
+
+MIT License · Built by [Mihir M. Patwardhan](https://github.com/mihirmpatwardhan)
+
+<br/>
 </div>
