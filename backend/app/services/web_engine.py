@@ -4,7 +4,7 @@ Web Automation Engine — Powered by browser-use & System Chrome Profiles
 Executes web automation tasks using browser-use and Playwright with:
   - User's REAL Chrome profile (saved logins, cookies, passwords, chosen Google account)
   - Active profile switching (supports "Default", "Profile 1", "Profile 2", etc.)
-  - Interactive multi-step actions (e.g. search YouTube, open playlists, select specific videos & play)
+  - Interactive multi-step actions across arbitrary public websites
   - Autonomous agent-driven execution via browser-use Agent
   - Real-time screenshot streaming to frontend Viewport via WebSocket
   - Security guard validation for all navigations
@@ -20,7 +20,6 @@ import shutil
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Any
-from urllib.parse import quote_plus
 
 from app.core.websocket_manager import manager
 from app.core.config import settings
@@ -144,116 +143,88 @@ def _copy_chrome_profile_for_automation(user_data_dir: Path, profile_name: str, 
     return automation_root
 
 
-def parse_youtube_request(text: str) -> tuple[str, int]:
-    """Extract a YouTube search query and target video index (0-based).
+_PAYMENT_STOP_REQUEST = re.compile(
+    r"\b(?:stop(?:s|ping|ped)?|halt(?:s|ing|ed)?|pause(?:s|d)?|before|at|until|up\s+to)\b"
+    r".{0,100}\b(?:payment|pay|upi|qr|scanner|scan)\b"
+    r"|\b(?:payment|pay|upi|qr|scanner|scan)\b.{0,100}"
+    r"\b(?:stop(?:s|ping|ped)?|halt(?:s|ing|ed)?|pause(?:s|d)?|before|at|until|up\s+to)\b",
+    re.IGNORECASE | re.DOTALL,
+)
+_PAYMENT_PAGE_MARKERS = re.compile(
+    r"\b(?:payment|upi|qr\s*code|scan\s*(?:to\s*)?pay|pay\s*(?:using|via)|payment\s*method)\b",
+    re.IGNORECASE,
+)
+_SENSITIVE_FORM_FIELD = re.compile(
+    r"\b(?:passenger|travell?er|full[ _-]?name|first[ _-]?name|last[ _-]?name|"
+    r"email|e[ _-]?mail|mobile|phone|contact|address|age|gender|dob|birth|"
+    r"card|cvv|upi|otp|pan|passport|identity)\b",
+    re.IGNORECASE,
+)
 
-    This intentionally handles short Marathi/Hinglish command words too. The
-    automation path must not send a natural-language command such as
-    ``youtube la ja ... play kar`` to YouTube as the search query.
+
+def _is_explicitly_authorized_form_value(task_query: str, target: str, value: str) -> bool:
+    """Allow personal form data only when the user actually supplied that value.
+
+    This is field- and website-agnostic. It keeps the agent from inventing a
+    passenger name, age, email, phone number, or payment credential to force a
+    booking flow to continue. Payment credentials are never typed by the agent.
     """
-    lowered = text.lower()
+    field = f"{target} {value}"
+    if _PAYMENT_PAGE_MARKERS.search(field) or re.search(r"\b(?:otp|cvv|card)\b", field, re.IGNORECASE):
+        return False
+    if not _SENSITIVE_FORM_FIELD.search(target):
+        return True
 
-    # Determine 0-based target index
-    index = 0
-    if re.search(r"\b(1st|first|1|pahila|pahili)\b\s+(?:video|result|one)", lowered):
-        index = 0
-    elif (
-        re.search(r"\b(2nd|second|2|dusra|dusari)\b\s+(?:video|result|one|nd video)", lowered)
-        or "2 nd video" in lowered
-        or "2nd video" in lowered
-        or "second video" in lowered
-        or "dusra video" in lowered
-    ):
-        index = 1
-    elif (
-        re.search(r"\b(3rd|third|3)\b\s+(?:video|result|one|rd video)", lowered)
-        or "3 rd video" in lowered
-        or "3rd video" in lowered
-        or "third video" in lowered
-    ):
-        index = 2
-    elif re.search(r"\b(4th|fourth|4)\b\s+(?:video|result|one|th video)", lowered):
-        index = 3
-    elif re.search(r"\b(5th|fifth|5)\b\s+(?:video|result|one|th video)", lowered):
-        index = 4
-
-    is_playlist_request = bool(re.search(
-        r"\b(playlist|channel|madhil|madhla|madhun|from)\b", lowered
-    ))
-
-    if is_playlist_request:
-        # Structured requests contain the useful names between the YouTube
-        # target and the ordinal/action tail. Keep those names and remove
-        # navigation filler in both English and Marathi transliteration.
-        query = re.sub(r"^.*?\byoutube\b", "", text, flags=re.I).strip()
-        query = re.sub(
-            r"\b(?:1st|2nd|3rd|4th|5th|first|second|third|fourth|fifth|pahila|pahili|dusra|dusari|\d+)\s+(?:video|result|one)\b",
-            " ",
-            query,
-            flags=re.I,
-        )
-        query = re.sub(
-            r"\b(?:play|watch|listen to|search for|search|find|open|launch|go|to|and|ani|on|in|the|from|of|la|ja|kar|karo|madhil|madhla|madhun|channel|playlist|please)\b",
-            " ",
-            query,
-            flags=re.I,
-        )
-    else:
-        patterns = [
-            r"(?:play|watch|listen to|search for|search|find)\s+(.+?)(?:\s+on youtube|\s+in youtube|$)",
-            r"youtube\s+(?:and\s+)?(?:play|watch|search for|search|find)\s+(.+)",
-            r"(?:open|go to)\s+youtube\s+(?:and\s+)?(?:play|watch|search for|search|find)\s+(.+)",
-        ]
-        query = ""
-        for pattern in patterns:
-            match = re.search(pattern, text, re.I)
-            if match:
-                query = match.group(1).strip()
-                break
-        if not query:
-            query = text
-
-        query = re.sub(
-            r"\b(?:1st|2nd|3rd|4th|5th|first|second|third|fourth|fifth|pahila|pahili|dusra|dusari|\d+\s*nd|\d+\s*rd|\d+\s*th|\d+)\s+video\b",
-            "",
-            query,
-            flags=re.I,
-        )
-        query = re.sub(r"\b(?:on|in)\s+youtube\b", "", query, flags=re.I)
-        query = re.sub(r"\b(?:open|launch)\s+youtube(?:\s+and)?\b", "", query, flags=re.I)
-        query = re.sub(r"\b(?:play|watch|search for|search|find)\b", "", query, flags=re.I)
-
-    clean_query = re.sub(r"\bplayalist\b", "playlist", query, flags=re.I)
-    clean_query = re.sub(r"[,\u2013\u2014]+", " ", clean_query)
-    clean_query = re.sub(r"\s+", " ", clean_query).strip(" ,.-")
-
-    return clean_query or query, index
+    normalized_value = re.sub(r"[^a-z0-9]+", "", value.casefold())
+    normalized_task = re.sub(r"[^a-z0-9]+", "", task_query.casefold())
+    # One-character values (such as a fabricated age of "2") are never a
+    # reliable proof that the user supplied a sensitive detail.
+    return len(normalized_value) >= 2 and normalized_value in normalized_task
 
 
-def _get_browser_use_llm():
-    """Instantiate the LLM for browser-use Agent."""
-    try:
-        from browser_use.llm import ChatGoogle, ChatOpenAI
-    except ImportError:
-        logger.warning("browser-use LLM wrappers not available")
-        return None
+def _completion_rejection_reason(
+    task_query: str,
+    summary: Any,
+    evidence: Any,
+    visible_text: Any,
+    successful_actions: int,
+) -> Optional[str]:
+    """Return why an agent's `done` response is not independently provable.
 
-    gemini_key = (os.getenv("GEMINI_API_KEY") or "").strip()
-    if gemini_key:
-        model = (os.getenv("GEMINI_MODEL") or "gemini-2.0-flash").strip()
-        try:
-            return ChatGoogle(model=model, api_key=gemini_key)
-        except Exception as e:
-            logger.warning(f"Failed to initialize ChatGoogle: {e}")
+    This is intentionally site-agnostic.  It validates the visible browser
+    state and the user's requested safe stop condition, never a vendor URL,
+    CSS selector, or booking-provider-specific word.
+    """
+    completion = str(summary or "").strip()
+    proof = str(evidence or "").strip()
+    page = re.sub(r"\s+", " ", str(visible_text or "")).strip()
 
-    openai_key = (os.getenv("OPENAI_API_KEY") or "").strip()
-    if openai_key:
-        model = (os.getenv("OPENAI_MODEL") or "gpt-4o").strip()
-        try:
-            return ChatOpenAI(model=model, api_key=openai_key)
-        except Exception as e:
-            logger.warning(f"Failed to initialize ChatOpenAI: {e}")
+    if successful_actions < 1:
+        return "No successful browser action has occurred yet"
+    if not completion or completion.casefold() in {"stub", "completed", "done"}:
+        return "The completion summary is empty or generic"
+    if len(proof) < 3:
+        return "The agent did not provide visible completion evidence"
+    if re.sub(r"\s+", " ", proof).casefold() not in page.casefold():
+        return "The claimed completion evidence is not visible in the browser"
+    if _PAYMENT_STOP_REQUEST.search(task_query) and not _PAYMENT_PAGE_MARKERS.search(page):
+        return "The requested payment/scan stopping point is not visible yet"
 
+    # The visible page should also still contain at least one specific term
+    # from the requested task. This prevents a generic banner such as "Done"
+    # or "Search" from becoming false completion evidence on an unrelated page.
+    ignored_terms = {
+        "about", "after", "before", "book", "browser", "cheapest", "click", "from", "into", "open",
+        "page", "payment", "please", "price", "scanner", "search", "stop", "task", "that", "the", "then",
+        "this", "ticket", "until", "with", "your",
+    }
+    requested_terms = {
+        word.casefold()
+        for word in re.findall(r"[A-Za-z0-9]{3,}", task_query)
+        if word.casefold() not in ignored_terms
+    }
+    if requested_terms and not any(re.search(rf"\b{re.escape(term)}\b", page, re.IGNORECASE) for term in requested_terms):
+        return "The visible page no longer contains a specific term from the requested task"
     return None
 
 
@@ -290,10 +261,8 @@ class WebAutomationEngine:
         The real profile remains available when explicitly enabled in settings.
         """
         try:
-            if bool(getattr(settings, "mcp_use_system_chrome", False)):
-                # System-Chrome mode is intentionally live-tab-only. Never
-                # launch a copied profile here: that creates a second,
-                # Guest-like browser and cannot guarantee the user's account.
+            if bool(getattr(settings, "mcp_use_system_chrome", False)) and live_chrome_bridge.connected:
+                # System-Chrome mode uses live extension bridge when connected.
                 logger.info("System Chrome mode uses the live extension bridge; no copied browser will be launched")
                 return False
 
@@ -302,7 +271,7 @@ class WebAutomationEngine:
             user_data_dir = _get_chrome_user_data_dir()
             profile_name = _get_active_profile_name()
             exe_path = _find_chrome_executable()
-            use_system_profile = bool(getattr(settings, "mcp_use_system_chrome", False))
+            use_system_profile = bool(getattr(settings, "mcp_use_system_chrome", False)) and live_chrome_bridge.connected
 
             logger.info(
                 f"Starting browser session: mode={'system Chrome' if use_system_profile else 'isolated Chromium'}, "
@@ -442,17 +411,13 @@ class WebAutomationEngine:
         """
         use_live = bool(getattr(settings, "mcp_use_system_chrome", False))
 
-        if use_live:
-            if not live_chrome_bridge.connected:
-                return {
-                    "success": False,
-                    "error": (
-                        "Live Chrome extension is not connected. "
-                        "Load chrome-extension/ in Chrome as an unpacked extension and keep Chrome open."
-                    ),
-                }
+        if use_live and live_chrome_bridge.connected:
             return await self._run_live_chrome_agent_task(
                 session_id, task_query or url, start_url=url or None, task_id=task_id
+            )
+        elif use_live and not live_chrome_bridge.connected:
+            logger.info(
+                "Live Chrome bridge is not connected. Seamlessly falling back to Playwright autonomous browser..."
             )
 
         # ── Isolated Playwright path ──────────────────────────────────────────
@@ -489,8 +454,7 @@ class WebAutomationEngine:
     ) -> dict:
         """
         Drive ANY website through the user's live Chrome tab using an LLM as the
-        decision-making brain. Works for BookMyShow, redBus, IRCTC, MakeMyTrip, Amazon, etc.
-        without any site-specific hardcoding.
+        decision-making brain without any site-specific hardcoding.
 
         Agent loop:
           1. Navigate to starting URL (if provided/inferred)
@@ -502,9 +466,14 @@ class WebAutomationEngine:
         """
         from app.services.llm_service import llm_service
 
-        max_steps = 20
+        cfg_max = getattr(settings, "max_agent_steps", 100)
+        max_steps = 1000 if cfg_max <= 0 else cfg_max
         step_results: list[str] = []
+        successful_actions = 0
+        invalid_or_failed_streak = 0
         last_url = ""
+        agent_failure = ""
+        last_attempted_step = 0
 
         async def _emit_step_start(step_idx: int, cmd_type: str, desc: str):
             if not task_id:
@@ -515,7 +484,7 @@ class WebAutomationEngine:
                     "session_id": session_id,
                     "task_id": task_id,
                     "step_index": step_idx,
-                    "total_steps": max_steps,
+                    "total_steps": max_steps if max_steps <= 100 else 100,
                     "command_type": cmd_type,
                     "description": desc,
                     "risk_level": "low",
@@ -653,11 +622,23 @@ class WebAutomationEngine:
                 logger.debug(f"DOM snapshot error: {snap_err}")
             return "(DOM snapshot unavailable)"
 
+        async def _get_visible_page_text() -> str:
+            """Read enough rendered text to prove a requested terminal state."""
+            try:
+                text = await live_chrome_bridge.request(
+                    "evaluate",
+                    {"expression": "(document.body && document.body.innerText || '').slice(0, 12000)"},
+                    timeout=6,
+                )
+                return str(text or "")
+            except Exception as page_text_err:
+                logger.debug(f"Completion evidence read failed: {page_text_err}")
+                return ""
+
         async def _auto_dismiss_popups() -> list[str]:
             """
             Proactively detect and dismiss visible popups, modal dialogs, cookie
             banners, or consent overlays before the LLM agent inspects the DOM.
-            before the LLM agent inspects the DOM.
             """
             dismiss_js = r"""
             (() => {
@@ -700,10 +681,17 @@ class WebAutomationEngine:
 
               if (scopes.length === 0) return null;
 
+              // A payment/OTP dialog is the requested stopping boundary for
+              // many workflows.  It is not a disposable popup, so leave it
+              // visible for the completion verifier instead of clicking past it.
+              const paymentBoundary = /\b(?:payment|upi|qr\s*code|scan\s*(?:to\s*)?pay|otp|cvv|card number)\b/i;
+              scopes = scopes.filter(scope => !paymentBoundary.test((scope.innerText || '').replace(/\s+/g, ' ')));
+              if (scopes.length === 0) return null;
+
               const positiveTerms = [
                 'continue', 'accept all', 'accept all cookies', 'accept', 'allow all', 'allow',
                 'i agree', 'agree', 'got it', 'ok', 'okay', 'dismiss', 'close', 'proceed',
-                'confirm', 'understood', 'reject all', 'reject'
+                'confirm', 'understood', 'reject all', 'reject', 'cancel', 'not now', 'no thanks'
               ];
 
               const buttonSelectors = 'button, [role="button"], a, input[type="button"], input[type="submit"], [class*="btn" i], [class*="button" i]';
@@ -775,14 +763,10 @@ class WebAutomationEngine:
                     btn_text = res.get("buttonText") or "popup button"
                     dismissed.append(btn_text)
                     logger.info(f"Auto-dismissed popup button: '{btn_text}'")
-                    x = res.get("x")
-                    y = res.get("y")
-                    if x is not None and y is not None:
-                        try:
-                            await live_chrome_bridge.request("click", {"x": x, "y": y}, timeout=3)
-                        except Exception:
-                            pass
-                    await asyncio.sleep(0.5)
+                    # The page-side click has already fired.  Sending another
+                    # CDP click here used to double-submit buttons or click the
+                    # page beneath a closing modal.
+                    await asyncio.sleep(0.25)
             except Exception as dismiss_err:
                 logger.debug(f"Auto-dismiss check error: {dismiss_err}")
             return dismissed
@@ -840,10 +824,13 @@ class WebAutomationEngine:
             t_nav0 = asyncio.get_event_loop().time()
             await _emit_step_start(0, "navigate", f"Open {start_url}")
             try:
+                verdict = security_guard.scan_url(start_url)
+                if not verdict.allowed:
+                    raise RuntimeError(f"URL blocked: {verdict.reason}")
                 await live_chrome_bridge.request("navigate", {"url": start_url}, timeout=20)
                 await self._smart_wait(
-                    lambda: live_chrome_bridge.request("evaluate", {"expression": "document.readyState === 'complete'"}, timeout=5),
-                    max_seconds=8, description="initial page load"
+                    lambda: live_chrome_bridge.request("evaluate", {"expression": "document.readyState !== 'loading'"}, timeout=5),
+                    max_seconds=5, description="initial page load"
                 )
                 last_url = await _take_live_shot(f"🌐 Navigated: {start_url}")
                 dur_ms = (asyncio.get_event_loop().time() - t_nav0) * 1000
@@ -855,6 +842,7 @@ class WebAutomationEngine:
 
         # ── Agent loop ───────────────────────────────────────────────────────
         for step_num in range(1, max_steps + 1):
+            last_attempted_step = step_num
             # Proactively dismiss any popup / consent / cookie banner before LLM sees DOM
             auto_dismissed = await _auto_dismiss_popups()
             if auto_dismissed:
@@ -877,7 +865,7 @@ Current browser state:
 {dom_context}
 
 Respond with EXACTLY ONE action in this JSON format (no prose, no markdown):
-{{"action": "<action_type>", "target": "<css_selector_or_url_or_text>", "value": "<text_to_type_if_applicable>", "reason": "<one_sentence_why>"}}
+{{"action": "<action_type>", "target": "<css_selector_or_url_or_text>", "value": "<text_to_type_if_applicable>", "reason": "<one_sentence_why>", "evidence": "<exact visible page text that proves done; required only for done>"}}
 
 Allowed action_types:
 - "navigate" — go to a URL (use target as full URL, value unused)
@@ -892,6 +880,8 @@ Allowed action_types:
 IMPORTANT:
 - If ANY popup, modal, cookie banner, or dialog is visible (such as "Continue", "Accept", "OK", "Allow", "Close", "Stay signed out"), you MUST click that button (e.g. action: "click", target: "Continue") first to dismiss the popup before trying to interact with the background page!
 - STOP IMMEDIATELY before any payment, OTP, or irreversible action — use "done" with a note
+- Never use "done" just because an action was sent. Use it only when the current visible page proves the user's requested end state. For "stop at/before payment, QR, UPI, or scanner", the visible page must show that payment/scan boundary.
+- For "done", set evidence to an exact short phrase currently visible on the page; do not invent it.
 - Use "click" with visible button text when you don't have a precise CSS selector
 - Fill forms field by field using "type" actions
 - After each navigation, wait for the page to load before acting"""
@@ -901,21 +891,32 @@ IMPORTANT:
             try:
                 action_data = await asyncio.wait_for(
                     llm_service.complete_json(agent_prompt),
-                    timeout=60.0,
+                    timeout=float(settings.agent_llm_timeout_seconds),
                 )
             except Exception as llm_err:
                 logger.error(f"Agent LLM call failed at step {step_num}: {llm_err}")
+                agent_failure = f"Agent LLM request failed at step {step_num}: {llm_err or 'no response'}"
                 break
 
             if not action_data or "action" not in action_data:
                 logger.warning(f"Agent step {step_num}: provider returned no usable action")
                 step_results.append(f"Step {step_num}: (parse error — skipped)")
+                invalid_or_failed_streak += 1
+                if invalid_or_failed_streak >= 3:
+                    return {
+                        "success": False,
+                        "error": "LLM returned no usable action three times; task stopped without claiming completion.",
+                        "url": last_url,
+                        "steps": step_num,
+                        "partial_progress": step_results,
+                    }
                 continue
 
-            action  = action_data.get("action", "")
-            target  = action_data.get("target", "")
-            value   = action_data.get("value", "")
-            reason  = action_data.get("reason", "")
+            action  = str(action_data.get("action", "")).strip().lower()
+            target  = str(action_data.get("target", ""))
+            value   = str(action_data.get("value", ""))
+            reason  = str(action_data.get("reason", ""))
+            evidence = action_data.get("evidence", "")
 
             logger.info(f"Agent step {step_num}: action={action} target={target[:80]} reason={reason[:80]}")
             step_results.append(f"Step {step_num}: {action} on '{target[:60]}' — {reason[:80]}")
@@ -928,6 +929,26 @@ IMPORTANT:
 
             # ── Execute action ────────────────────────────────────────────────
             if action == "done":
+                completion_reason = _completion_rejection_reason(
+                    task_query, target, evidence, await _get_visible_page_text(), successful_actions
+                )
+                if completion_reason:
+                    invalid_or_failed_streak += 1
+                    step_results.append(f"Step {step_num}: rejected premature completion — {completion_reason}")
+                    dur_ms = (asyncio.get_event_loop().time() - t_step0) * 1000
+                    await _emit_step_completed(
+                        step_num, "done", False, dur_ms, error=completion_reason
+                    )
+                    if invalid_or_failed_streak >= 3:
+                        return {
+                            "success": False,
+                            "error": f"Agent repeatedly claimed completion without proof: {completion_reason}",
+                            "url": last_url,
+                            "steps": step_num,
+                            "partial_progress": step_results,
+                        }
+                    continue
+                invalid_or_failed_streak = 0
                 dur_ms = (asyncio.get_event_loop().time() - t_step0) * 1000
                 last_url = await _take_live_shot(f"✅ Done (step {step_num}): {target[:60]}")
                 await _emit_step_completed(step_num, "done", True, dur_ms, output=target)
@@ -944,12 +965,17 @@ IMPORTANT:
                 step_err = ""
                 nav_url = target if target.startswith("http") else f"https://{target}"
                 try:
+                    verdict = security_guard.scan_url(nav_url)
+                    if not verdict.allowed:
+                        raise RuntimeError(f"URL blocked: {verdict.reason}")
                     await live_chrome_bridge.request("navigate", {"url": nav_url}, timeout=20)
                     await self._smart_wait(
-                        lambda: live_chrome_bridge.request("evaluate", {"expression": "document.readyState === 'complete'"}, timeout=5),
-                        max_seconds=10, description=f"navigate to {nav_url[:50]}"
+                        lambda: live_chrome_bridge.request("evaluate", {"expression": "document.readyState !== 'loading'"}, timeout=5),
+                        max_seconds=6, description=f"navigate to {nav_url[:50]}"
                     )
                     last_url = await _take_live_shot(f"🌐 Step {step_num}: Navigated to {nav_url[:50]}")
+                    successful_actions += 1
+                    invalid_or_failed_streak = 0
                 except Exception as nav_err:
                     step_ok = False
                     step_err = str(nav_err)
@@ -1018,29 +1044,42 @@ IMPORTANT:
                         res = await live_chrome_bridge.request("evaluate", {"expression": js_click}, timeout=10)
                         if res and isinstance(res, dict) and res.get("clicked"):
                             clicked_ok = True
-                            x_c, y_c = res.get("x"), res.get("y")
-                            if x_c is not None:
-                                try:
-                                    await live_chrome_bridge.request("click", {"x": x_c, "y": y_c}, timeout=5)
-                                except Exception:
-                                    pass
                     except Exception as js_err:
                         step_err = str(js_err)
 
                 if clicked_ok:
                     await asyncio.sleep(0.5)
                     last_url = await _take_live_shot(f"👆 Step {step_num}: Clicked '{target[:50]}'")
+                    successful_actions += 1
+                    invalid_or_failed_streak = 0
                 else:
                     step_ok = False
                     if not step_err:
                         step_err = f"Target not found: {target[:60]}"
                     step_results.append(f"Step {step_num}: click failed — {step_err}")
+                    invalid_or_failed_streak += 1
                 dur_ms = (asyncio.get_event_loop().time() - t_step0) * 1000
                 await _emit_step_completed(step_num, "click", step_ok, dur_ms, output=f"Clicked '{target[:50]}'", error=step_err)
 
             elif action == "type":
                 step_ok = True
                 step_err = ""
+                if not _is_explicitly_authorized_form_value(task_query, target, value):
+                    step_ok = False
+                    step_err = "Refusing to invent personal or payment information not supplied in the task"
+                    invalid_or_failed_streak += 1
+                    step_results.append(f"Step {step_num}: blocked unsafe form entry for '{target[:60]}'")
+                    dur_ms = (asyncio.get_event_loop().time() - t_step0) * 1000
+                    await _emit_step_completed(step_num, "type", False, dur_ms, error=step_err)
+                    if invalid_or_failed_streak >= 3:
+                        return {
+                            "success": False,
+                            "error": step_err,
+                            "url": last_url,
+                            "steps": step_num,
+                            "partial_progress": step_results,
+                        }
+                    continue
                 highlighted = await _highlight_live_target(target)
                 if highlighted:
                     last_url = await _take_live_shot(f"🎯 Step {step_num}: About to type in '{target[:50]}'")
@@ -1078,10 +1117,15 @@ IMPORTANT:
                         step_results.append(f"Step {step_num}: type target not found: {target[:60]}")
                         step_ok = False
                         step_err = f"Target not found: {target[:60]}"
+                        invalid_or_failed_streak += 1
+                    else:
+                        successful_actions += 1
+                        invalid_or_failed_streak = 0
                 except Exception as type_err:
                     step_ok = False
                     step_err = str(type_err)
                     step_results.append(f"Step {step_num}: type error — {type_err}")
+                    invalid_or_failed_streak += 1
                 dur_ms = (asyncio.get_event_loop().time() - t_step0) * 1000
                 await _emit_step_completed(step_num, "type", step_ok, dur_ms, output=f"Typed into '{target[:50]}'", error=step_err)
 
@@ -1091,8 +1135,10 @@ IMPORTANT:
                     await live_chrome_bridge.request("evaluate", {"expression": direction}, timeout=5)
                     await asyncio.sleep(0.5)
                     last_url = await _take_live_shot(f"📜 Step {step_num}: Scrolled {target}")
+                    successful_actions += 1
+                    invalid_or_failed_streak = 0
                 except Exception:
-                    pass
+                    invalid_or_failed_streak += 1
                 dur_ms = (asyncio.get_event_loop().time() - t_step0) * 1000
                 await _emit_step_completed(step_num, "scroll", True, dur_ms, output=f"Scrolled {target}")
 
@@ -1102,8 +1148,9 @@ IMPORTANT:
                     secs = float(target) if target else 1.0
                     await asyncio.sleep(min(secs, 5.0))
                     last_url = await _take_live_shot(f"⏳ Step {step_num}: Waited {secs}s")
+                    invalid_or_failed_streak = 0
                 except Exception:
-                    pass
+                    invalid_or_failed_streak += 1
                 dur_ms = (asyncio.get_event_loop().time() - t_step0) * 1000
                 await _emit_step_completed(step_num, "wait", True, dur_ms, output=f"Waited {secs}s")
 
@@ -1124,15 +1171,40 @@ IMPORTANT:
                     read_summary = str(read_result)[:200]
                     step_results.append(f"Step {step_num}: read result — {read_summary}")
                     last_url = await _take_live_shot(f"🔍 Step {step_num}: Read '{target[:40]}'")
+                    successful_actions += 1
+                    invalid_or_failed_streak = 0
                 except Exception as read_err:
                     step_ok = False
                     step_err = str(read_err)
                     step_results.append(f"Step {step_num}: read error — {read_err}")
+                    invalid_or_failed_streak += 1
                 dur_ms = (asyncio.get_event_loop().time() - t_step0) * 1000
                 await _emit_step_completed(step_num, "read", step_ok, dur_ms, output=read_summary, error=step_err)
 
             else:
                 logger.warning(f"Agent step {step_num}: unknown action '{action}' — skipping")
+                invalid_or_failed_streak += 1
+
+            if invalid_or_failed_streak >= 3:
+                return {
+                    "success": False,
+                    "error": "Agent made three consecutive invalid or failed actions; stopping instead of falsely completing.",
+                    "url": last_url,
+                    "steps": step_num,
+                    "partial_progress": step_results,
+                }
+
+        # A model/provider failure is not a max-step exhaustion. Keeping these
+        # states separate prevents misleading progress and completion messages.
+        if agent_failure:
+            last_url = await _take_live_shot(f"❌ Agent stopped: {agent_failure[:60]}")
+            return {
+                "success": False,
+                "error": agent_failure,
+                "url": last_url,
+                "steps": last_attempted_step,
+                "partial_progress": step_results,
+            }
 
         # Max steps reached
         last_url = await _take_live_shot(f"⚠️ Agent: max steps ({max_steps}) reached")
@@ -1144,803 +1216,9 @@ IMPORTANT:
             "partial_progress": step_results,
         }
 
-    async def _handle_live_chrome_bus_task(self, session_id: str, task_query: str) -> dict:
-        """Run the bus planning or booking flow in the user's live Chrome tab."""
-        lowered = task_query.lower()
-        if "book" in lowered and "do not book" not in lowered:
-            return await self._handle_live_chrome_bus_booking_task(session_id, task_query)
-
-        if not live_chrome_bridge.connected:
-            return {
-                "success": False,
-                "error": "Live Chrome is not connected; no copied or Guest browser will be opened",
-            }
-
-        search_url = (
-            "https://www.google.com/search?q="
-            + quote_plus("Pune to Mumbai bus cheapest fare redBus AbhiBus")
-        )
-        try:
-            await live_chrome_bridge.request("navigate", {"url": search_url}, timeout=20)
-            await asyncio.sleep(1.0)
-            visible_text = ""
-            for _ in range(20):
-                state = await live_chrome_bridge.request(
-                    "evaluate",
-                    {
-                        "expression": """
-                            ({
-                              ready: document.readyState,
-                              title: document.title,
-                              text: (document.body && document.body.innerText || '').slice(0, 5000)
-                            })
-                        """,
-                    },
-                    timeout=10,
-                )
-                if state and state.get("ready") == "complete" and state.get("text"):
-                    visible_text = state["text"]
-                    break
-                await asyncio.sleep(0.5)
-
-            tab = await live_chrome_bridge.request("tab", timeout=10)
-            shot = await live_chrome_bridge.request("screenshot", timeout=15)
-            await manager.send_to_session(session_id, {
-                "type": "viewport_screenshot",
-                "label": f"🚌 Live Chrome: {tab.get('title', 'Pune to Mumbai bus search') if tab else 'Bus fare search'}",
-                "data": shot.get("data") if shot else "",
-                "format": "jpeg",
-                "timestamp": datetime.utcnow().isoformat(),
-            })
-            if not visible_text:
-                return {"success": False, "error": "Bus fare search did not load in live Chrome"}
-            return {
-                "success": True,
-                "title": tab.get("title", "") if tab else "",
-                "url": tab.get("url", search_url) if tab else search_url,
-                "output": (
-                    "Pune to Mumbai bus fare search opened in your live Chrome account. "
-                    "No booking or payment was performed. Exact cheapest fare requires a travel date."
-                ),
-            }
-        except Exception as error:
-            logger.error(f"Live Chrome bus task failed: {error}", exc_info=True)
-            return {"success": False, "error": str(error)}
-
-    async def _handle_live_chrome_bus_booking_task(self, session_id: str, task_query: str) -> dict:
-        """Book the cheapest matching bus, stopping before payment/QR/OTP."""
-        if not live_chrome_bridge.connected:
-            return {"success": False, "error": "Live Chrome is not connected; booking was not started"}
-
-        def field(name: str, default: str = "") -> str:
-            match = re.search(rf"{re.escape(name)}=([^;]+)", task_query, re.I)
-            return match.group(1).strip() if match else default
-
-        date_value = field("date", "01/09/2026")
-        try:
-            date_obj = datetime.strptime(date_value, "%d/%m/%Y")
-            date_aria_label = f"{date_obj:%A}, {date_obj:%B} {date_obj.day}, {date_obj:%Y}"
-        except ValueError:
-            date_aria_label = "Tuesday, September 1, 2026"
-        passenger_1 = field("passenger1_name")
-        passenger_2 = field("passenger2_name")
-        age_1 = field("passenger1_age", "20")
-        age_2 = field("passenger2_age", "21")
-        email_1 = field("passenger1_email")
-        email_2 = field("passenger2_email")
-        phone_1 = field("passenger1_phone")
-        phone_2 = field("passenger2_phone")
-
-        if not passenger_1 or not passenger_2 or not phone_1:
-            return {"success": False, "error": "Real passenger names and contact details are required; dummy data is disabled"}
-
-        homepage = "https://www.redbus.in/"
-        try:
-            await live_chrome_bridge.request("navigate", {"url": homepage}, timeout=20)
-            await asyncio.sleep(1.0)
-
-            form_state = None
-            for _ in range(20):
-                form_state = await live_chrome_bridge.request(
-                    "evaluate",
-                    {
-                        "expression": f"""
-                        (() => {{
-                          const inputs = Array.from(document.querySelectorAll('input'));
-                          const find = (terms) => inputs.find(el => terms.some(term =>
-                            ((el.id || '') + ' ' + (el.name || '') + ' ' + (el.placeholder || '') + ' ' + (el.getAttribute('aria-label') || '')).toLowerCase().includes(term)));
-                          const setValue = (el, value) => {{
-                            if (!el) return false;
-                            const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
-                            if (setter) setter.call(el, value); else el.value = value;
-                            el.dispatchEvent(new Event('input', {{ bubbles: true }}));
-                            el.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                            return true;
-                          }};
-                          const source = document.querySelector('#srcinput') || find(['source', 'from', 'origin', 'src']);
-                          const destination = document.querySelector('#destinput') || find(['destination', 'to', 'dest']);
-                          const date = find(['onward', 'travel date', 'journey date', 'date']);
-                          source?.focus();
-                          if (source) source.value = '';
-                          if (destination) destination.value = '';
-                          return {{
-                            source: !!source,
-                            destination: !!destination,
-                            date: !!date
-                          }};
-                        }})()
-                        """,
-                    },
-                    timeout=15,
-                )
-                if form_state and form_state.get("source") and form_state.get("destination"):
-                    break
-                await asyncio.sleep(0.5)
-            if not form_state or not form_state.get("source") or not form_state.get("destination"):
-                return {"success": False, "error": "redBus source/destination form was not available"}
-
-            await live_chrome_bridge.request(
-                "evaluate",
-                {"expression": "document.querySelector('#srcinput')?.focus(); document.execCommand('insertText', false, 'Pune'); true"},
-                timeout=10,
-            )
-
-            await asyncio.sleep(1.2)
-            await live_chrome_bridge.request(
-                "evaluate",
-                {
-                    "expression": """
-                        (() => {
-                          const exact = (value) => Array.from(document.querySelectorAll('[role="option"], li'))
-                            .filter(el => el.getBoundingClientRect().width > 0 && el.getBoundingClientRect().height > 0)
-                            .find(el => (el.innerText || '').trim().toLowerCase().startsWith(value));
-                          const source = exact('pune to mumbai bus') || exact('pune');
-                          if (source) source.click();
-                          return !!source;
-                        })()
-                    """,
-                },
-                timeout=10,
-            )
-            await asyncio.sleep(1.2)
-            await live_chrome_bridge.request(
-                "evaluate",
-                {"expression": "document.querySelector('#destinput')?.focus(); true"},
-                timeout=10,
-            )
-            await live_chrome_bridge.request(
-                "evaluate",
-                {"expression": "document.querySelector('#destinput')?.focus(); document.execCommand('insertText', false, 'Mumbai'); true"},
-                timeout=10,
-            )
-            await asyncio.sleep(1.2)
-            await live_chrome_bridge.request(
-                "evaluate",
-                {
-                    "expression": """
-                        (() => {
-                          const exact = (value) => Array.from(document.querySelectorAll('[role="option"], li'))
-                            .filter(el => el.getBoundingClientRect().width > 0 && el.getBoundingClientRect().height > 0)
-                            .find(el => (el.innerText || '').trim().toLowerCase().startsWith(value));
-                          const destination = exact('mumbai') || exact('mumbai to pune bus');
-                          if (destination) destination.click();
-                          return !!destination;
-                        })()
-                    """,
-                },
-                timeout=10,
-            )
-
-            await live_chrome_bridge.request(
-                "evaluate",
-                {
-                    "expression": """
-                        (() => {
-                          const control = document.querySelector('[aria-label="Select date of journey"]');
-                          if (control) { control.click(); return true; }
-                          return false;
-                        })()
-                    """,
-                },
-                timeout=10,
-            )
-            await asyncio.sleep(0.5)
-            await live_chrome_bridge.request(
-                "evaluate",
-                {
-                    "expression": """
-                        (() => {
-                          const next = Array.from(document.querySelectorAll('button, [role="button"]'))
-                            .find(el => /next|forward|arrow-right/i.test((el.getAttribute('aria-label') || '') + ' ' + (el.getAttribute('title') || '')));
-                          if (next) next.click();
-                          return !!next;
-                        })()
-                    """,
-                },
-                timeout=10,
-            )
-            await asyncio.sleep(0.5)
-            await live_chrome_bridge.request(
-                "evaluate",
-                {
-                    "expression": """
-                        (() => {
-                          const target = '{date_aria_label}';
-                          const cell = document.querySelector(`[aria-label="${target}"]`)
-                            || Array.from(document.querySelectorAll('.calendarDate, [role="gridcell"], [role="option"]'))
-                              .find(el => (el.getAttribute('aria-label') || '').trim() === target);
-                          if (cell && cell.getBoundingClientRect().width > 0) {
-                            (cell.parentElement?.matches('li') ? cell.parentElement : cell).click();
-                            return true;
-                          }
-                          return false;
-                        })()
-                    """,
-                },
-                timeout=10,
-            )
-
-            await asyncio.sleep(0.8)
-            # Build dynamic date strings from actual date_obj (Fix 1 — no more hardcoded date)
-            _expected_date      = f"{date_obj.day} {date_obj.strftime('%b')}, {date_obj.year}"
-            _expected_date_zero = f"{date_obj.strftime('%d %b, %Y')}"
-            date_state = await live_chrome_bridge.request(
-                "evaluate",
-                {
-                    "expression": f"""
-                        (() => {{
-                          const text = (document.querySelector('[aria-label="Select date of journey"]')?.innerText || document.body?.innerText || '');
-                          return {{
-                              date_text: text.slice(0, 160),
-                              target_present: text.includes('{_expected_date}') || text.includes('{_expected_date_zero}')
-                          }};
-                        }})()
-                    """,
-                },
-                timeout=10,
-            )
-            if not date_state or not date_state.get("target_present"):
-                return {"success": False, "error": f"redBus did not accept the requested journey date ({date_value}); booking stopped before search"}
-
-            await live_chrome_bridge.request(
-                "evaluate",
-                {
-                    "expression": """
-                        (() => {
-                          const buttons = Array.from(document.querySelectorAll('button, input[type="submit"]'));
-                          const search = buttons.find(el => /search buses|search/i.test((el.innerText || el.value || '').trim()));
-                          if (search) search.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
-                          return !!search;
-                        })()
-                    """,
-                },
-                timeout=10,
-            )
-            # Smart wait — poll every 100ms for bus list to appear, max 6s (Fix 4)
-            await self._smart_wait(
-                lambda: live_chrome_bridge.request(
-                    "evaluate",
-                    {"expression": r"""!!document.querySelector('button[class*="view"], button[class*="select"], button[class*="seat"], .bus-card, .bus-item, .rb-tabs-head')"""},
-                    timeout=5,
-                ),
-                max_seconds=6.0,
-                description="bus search results loaded",
-            )
-
-            selected_bus = await live_chrome_bridge.request(
-                "evaluate",
-                {
-                    # Fix 2 — raw string r""" so \s does not produce a SyntaxWarning
-                    "expression": r"""
-                        (() => {
-                          const buttons = Array.from(document.querySelectorAll('button'))
-                            .filter(el => /view seats|select seats/i.test((el.innerText || '').trim()));
-                          const candidates = buttons.map(button => {
-                            let card = button;
-                            for (let i = 0; i < 6 && card.parentElement; i++) {
-                              if (/\u20b9\s?[\d,]+/.test(card.innerText || '')) break;
-                              card = card.parentElement;
-                            }
-                            const match = (card.innerText || '').match(/\u20b9\s?([\d,]+)/);
-                            return { button, fare: match ? Number(match[1].replace(/,/g, '')) : Number.MAX_SAFE_INTEGER };
-                          }).sort((a, b) => a.fare - b.fare)[0];
-                          if (candidates?.button) { candidates.button.click(); return candidates.fare; }
-                          return null;
-                        })()
-                    """,
-                },
-                timeout=15,
-            )
-            if selected_bus is None:
-                return {"success": False, "error": "No bus seat-selection button was found"}
-            # Smart wait — check every 100ms for seat map, max 5 seconds (Fix 4)
-            await self._smart_wait(
-                lambda: live_chrome_bridge.request(
-                    "evaluate",
-                    {"expression": r"""!!document.querySelector('[class*=\"seat\"], [data-testid*=\"seat\"]')"""},
-                    timeout=5,
-                ),
-                max_seconds=5.0,
-                description="seat map loaded",
-            )
-
-            seat_selected = await live_chrome_bridge.request(
-                "evaluate",
-                {
-                    "expression": """
-                        (() => {
-                          const seats = Array.from(document.querySelectorAll('[class*="seat"], [data-testid*="seat"]'))
-                            .filter(el => el.getBoundingClientRect().width > 0 && el.getBoundingClientRect().height > 0)
-                            .filter(el => !/sold|unavailable|booked|selected/i.test(el.className + ' ' + (el.getAttribute('aria-label') || '')));
-                          if (seats[0]) { seats[0].click(); return true; }
-                          return false;
-                        })()
-                    """,
-                },
-                timeout=15,
-            )
-            if not seat_selected:
-                return {"success": False, "error": "No available seat could be selected automatically"}
-
-            await live_chrome_bridge.request(
-                "evaluate",
-                {
-                    "expression": """
-                        (() => {
-                          const buttons = Array.from(document.querySelectorAll('button'));
-                          const next = buttons.find(el => /continue|proceed/i.test((el.innerText || '').trim()));
-                          if (next) next.click();
-                          return !!next;
-                        })()
-                    """,
-                },
-                timeout=10,
-            )
-            await asyncio.sleep(2.0)
-
-            filled = await live_chrome_bridge.request(
-                "evaluate",
-                {
-                    "expression": f"""
-                        (() => {{
-                          const inputs = Array.from(document.querySelectorAll('input'));
-                          const setValue = (el, value) => {{
-                            if (!el) return false;
-                            const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
-                            if (setter) setter.call(el, value); else el.value = value;
-                            el.dispatchEvent(new Event('input', {{ bubbles: true }}));
-                            el.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                            return true;
-                          }};
-                          const textInputs = inputs.filter(el => /text|email|tel|number/.test(el.type || 'text'));
-                          const by = (terms) => inputs.find(el => terms.some(term =>
-                            ((el.name || '') + ' ' + (el.id || '') + ' ' + (el.placeholder || '') + ' ' + (el.getAttribute('aria-label') || '')).toLowerCase().includes(term)));
-                          let count = 0;
-                          count += setValue(by(['email']), '{email_1}') ? 1 : 0;
-                          count += setValue(by(['mobile', 'phone', 'contact']), '{phone_1}') ? 1 : 0;
-                          const names = inputs.filter(el => /name|passenger/.test((el.name || '') + ' ' + (el.id || '') + ' ' + (el.placeholder || '')).toLowerCase());
-                          count += setValue(names[0], '{passenger_1}') ? 1 : 0;
-                          count += setValue(names[1], '{passenger_2}') ? 1 : 0;
-                          const ages = inputs.filter(el => /age/.test((el.name || '') + ' ' + (el.id || '') + ' ' + (el.placeholder || '')).toLowerCase());
-                          count += setValue(ages[0], '{age_1}') ? 1 : 0;
-                          count += setValue(ages[1], '{age_2}') ? 1 : 0;
-                          return count;
-                        }})()
-                    """,
-                },
-                timeout=15,
-            )
-
-            const_state = await live_chrome_bridge.request(
-                "evaluate",
-                {
-                    "expression": """
-                        (() => {
-                          const text = (document.body?.innerText || '').slice(0, 12000);
-                          const qr = /\bqr\b|scan.*pay|upi|payment/i.test(text);
-                          return { qr, title: document.title, text: text.slice(0, 1200) };
-                        })()
-                    """,
-                },
-                timeout=10,
-            )
-            const_state = const_state or {}
-            const_shot = await live_chrome_bridge.request("screenshot", timeout=15)
-            await manager.send_to_session(session_id, {
-                "type": "viewport_screenshot",
-                "label": "🚌 Live Chrome booking stopped before payment/QR",
-                "data": const_shot.get("data") if const_shot else "",
-                "format": "jpeg",
-                "timestamp": datetime.utcnow().isoformat(),
-            })
-            if const_state.get("qr"):
-                return {"success": True, "title": const_state.get("title", ""), "output": "QR/payment page reached; automation stopped before OTP or payment"}
-            return {"success": True, "title": const_state.get("title", ""), "output": "Passenger details filled in live Chrome; automation stopped before payment/QR"}
-        except Exception as error:
-            logger.error(f"Live Chrome bus booking failed: {error}", exc_info=True)
-            return {"success": False, "error": str(error)}
-
-    async def _handle_live_chrome_youtube_task(self, session_id: str, task_query: str) -> dict:
-        """Run the YouTube flow in the user's real, already-open Chrome tab."""
-        if not live_chrome_bridge.connected:
-            return {
-                "success": False,
-                "error": (
-                    "Live Chrome is not connected. Load chrome-extension/ in Chrome as an unpacked extension "
-                    "and keep the signed-in Chrome window open."
-                ),
-            }
-
-        query, target_index = parse_youtube_request(task_query)
-        logger.info(f"Live Chrome YouTube request: query='{query}', target_index={target_index}")
-        search_url = f"https://www.youtube.com/results?search_query={quote_plus(query)}"
-        try:
-            await live_chrome_bridge.request("navigate", {"url": search_url}, timeout=15)
-            await asyncio.sleep(1.5)
-
-            results = None
-            for _ in range(30):
-                results = await live_chrome_bridge.request(
-                    "evaluate",
-                    {
-                        "expression": """
-                            (() => {
-                              // Auto-dismiss any Google / YouTube consent popup or "Continue" dialog
-                              const consentBtns = Array.from(document.querySelectorAll(
-                                'button, [role="button"], a, input[type="submit"]'
-                              )).filter(b => {
-                                const t = (b.innerText || b.value || b.getAttribute('aria-label') || '').trim().toLowerCase();
-                                return t === 'accept all' || t === 'i agree' || t === 'agree' || t === 'continue' || t === 'reject all' || t.includes('accept all') || t === 'stay signed out';
-                              });
-                              if (consentBtns.length > 0) {
-                                consentBtns[0].click();
-                              }
-
-                              const playlists = [];
-                              // 1. Specific YouTube playlist renderers
-                              document.querySelectorAll('ytd-playlist-renderer').forEach(renderer => {
-                                const titleEl = renderer.querySelector('#video-title, h3 a');
-                                const fullLink = renderer.querySelector('a[href*="/playlist?list="]');
-                                const watchLink = renderer.querySelector('a[href*="list="]');
-                                const title = (titleEl?.innerText || titleEl?.getAttribute('title') || '').trim();
-                                const href = fullLink?.href || watchLink?.href || '';
-                                if (title && href) {
-                                  playlists.push({ title, href });
-                                }
-                              });
-                              // 2. Any link containing list=
-                              document.querySelectorAll('a[href*="list="]').forEach(a => {
-                                const title = (a.innerText || a.getAttribute('title') || a.getAttribute('aria-label') || '').trim();
-                                const href = a.href;
-                                if (title && href && !title.toLowerCase().includes('view full playlist') && !playlists.some(p => p.href === href)) {
-                                  playlists.push({ title, href });
-                                }
-                              });
-
-                              const videos = [];
-                              document.querySelectorAll('ytd-video-renderer, #contents ytd-video-renderer').forEach(renderer => {
-                                const titleEl = renderer.querySelector('#video-title');
-                                if (titleEl && titleEl.href && !titleEl.href.includes('/shorts/')) {
-                                  const title = (titleEl.innerText || titleEl.getAttribute('title') || '').trim();
-                                  if (title) videos.push({ title, href: titleEl.href });
-                                }
-                              });
-                              if (videos.length === 0) {
-                                document.querySelectorAll('a#video-title[href*="watch?v="]').forEach(a => {
-                                  const title = (a.innerText || a.getAttribute('title') || '').trim();
-                                  if (title && !a.href.includes('/shorts/')) videos.push({ title, href: a.href });
-                                });
-                              }
-
-                              return {
-                                ready: document.readyState,
-                                playlists,
-                                videos,
-                              };
-                            })()
-                        """,
-                    },
-                    timeout=10,
-                )
-                if results and (results.get("playlists") or results.get("videos")):
-                    break
-                await asyncio.sleep(0.5)
-
-            if not results:
-                return {"success": False, "error": "Live Chrome returned no YouTube results"}
-
-            playlist_request = bool(re.search(r"\b(playlist|playlists|channel)\b", task_query, re.I))
-            query_tokens = [token for token in query.lower().split() if len(token) > 2]
-            playlists = results.get("playlists") or []
-            videos = results.get("videos") or []
-
-            logger.info(f"YouTube parsed: {len(playlists)} playlists, {len(videos)} videos (is_playlist={playlist_request})")
-
-            if playlist_request and playlists:
-                chosen = next(
-                    (
-                        item for item in playlists
-                        if sum(token in item["title"].lower() for token in query_tokens) >= max(1, min(2, len(query_tokens)))
-                    ),
-                    playlists[0],
-                )
-                list_match = re.search(r"[?&]list=([a-zA-Z0-9_-]+)", chosen["href"])
-                playlist_url = f"https://www.youtube.com/playlist?list={list_match.group(1)}" if list_match else chosen["href"]
-                logger.info(f"Opening playlist URL: {playlist_url}")
-                await live_chrome_bridge.request("navigate", {"url": playlist_url}, timeout=15)
-                await asyncio.sleep(1.5)
-
-                playlist_items = None
-                for _ in range(30):
-                    playlist_items = await live_chrome_bridge.request(
-                        "evaluate",
-                        {
-                            "expression": """
-                            (() => {
-                              const items = [];
-                              const seen = new Set();
-                              document.querySelectorAll('ytd-playlist-video-renderer').forEach(renderer => {
-                                const titleEl = renderer.querySelector('#video-title, a.yt-simple-endpoint[href*="watch?v="]');
-                                if (!titleEl) return;
-                                const href = titleEl.href || '';
-                                const match = href.match(/watch\\?v=([a-zA-Z0-9_-]+)/);
-                                const videoId = match ? match[1] : href;
-                                if (videoId && !seen.has(videoId)) {
-                                  seen.add(videoId);
-                                  const title = (titleEl.innerText || titleEl.getAttribute('title') || '').trim();
-                                  items.push({ title, href, videoId });
-                                }
-                              });
-                              if (items.length === 0) {
-                                document.querySelectorAll('a[href*="watch?v="]').forEach(a => {
-                                  const href = a.href || '';
-                                  const match = href.match(/watch\\?v=([a-zA-Z0-9_-]+)/);
-                                  const videoId = match ? match[1] : '';
-                                  const title = (a.innerText || a.getAttribute('title') || '').trim();
-                                  if (videoId && title && !seen.has(videoId) && !href.includes('/shorts/')) {
-                                    seen.add(videoId);
-                                    items.push({ title, href, videoId });
-                                  }
-                                });
-                              }
-                              return items;
-                            })()
-                            """,
-                        },
-                        timeout=10,
-                    )
-                    if playlist_items and len(playlist_items) > target_index:
-                        break
-                    await asyncio.sleep(0.5)
-
-                if not playlist_items:
-                    return {"success": False, "error": "Live Chrome opened the playlist but no videos were found"}
-
-                selected_idx = min(target_index, len(playlist_items) - 1)
-                selected = playlist_items[selected_idx]
-                logger.info(f"Selected playlist video index {selected_idx}: {selected['title']} ({selected['href']})")
-                await live_chrome_bridge.request("navigate", {"url": selected["href"]}, timeout=15)
-                selected_title = selected.get("title", "")
-            else:
-                if not videos:
-                    return {"success": False, "error": f"No YouTube videos found for '{query}'"}
-                selected_idx = min(target_index, len(videos) - 1)
-                selected = videos[selected_idx]
-                logger.info(f"Selected search video index {selected_idx}: {selected['title']} ({selected['href']})")
-                await live_chrome_bridge.request("navigate", {"url": selected["href"]}, timeout=15)
-                selected_title = selected.get("title", "")
-
-            await asyncio.sleep(1.5)
-            playing = False
-            for _ in range(20):
-                playing = await live_chrome_bridge.request(
-                    "evaluate",
-                    {
-                        "expression": """
-                            (async () => {
-                              const video = document.querySelector('video');
-                              if (!video) return false;
-                              video.muted = false;
-                              if (video.paused) { try { await video.play(); } catch (_) {} }
-                              const button = document.querySelector('.ytp-play-button');
-                              if (video.paused && button) button.click();
-                              return !video.paused;
-                            })()
-                        """,
-                    },
-                    timeout=10,
-                )
-                if playing:
-                    break
-                await asyncio.sleep(0.5)
-
-            tab = await live_chrome_bridge.request("tab", timeout=10)
-            shot = await live_chrome_bridge.request("screenshot", timeout=15)
-            label = f"▶️ Live Chrome: {tab.get('title', '') if tab else selected_title}"
-            await manager.send_to_session(session_id, {
-                "type": "viewport_screenshot",
-                "label": label,
-                "data": shot.get("data") if shot else "",
-                "format": "jpeg",
-                "timestamp": datetime.utcnow().isoformat(),
-            })
-            return {
-                "success": True,
-                "title": tab.get("title", "") if tab else selected_title,
-                "url": tab.get("url", "") if tab else selected.get("href", ""),
-                "output": f"Now playing video #{target_index + 1} ({selected_title}) in YouTube playlist in live Chrome",
-            }
-        except Exception as error:
-            logger.error(f"Live Chrome YouTube task failed: {error}", exc_info=True)
-            return {"success": False, "error": str(error)}
-
-    async def _handle_youtube_task(self, session_id: str, page: Any, task_query: str) -> dict:
-        """
-        Execute YouTube search, find playlists/videos, select specified video index, and play.
-        """
-        query, target_index = parse_youtube_request(task_query)
-        logger.info(f"YouTube automation: query='{query}', target_video_index={target_index}")
-
-        search_url = f"https://www.youtube.com/results?search_query={quote_plus(query)}"
-
-        # 1. Navigate to YouTube Search
-        await self._stream_screenshot(session_id, page, f"🔍 Searching YouTube: '{query}'")
-        try:
-            await page.goto(search_url, wait_until="domcontentloaded", timeout=30000)
-            await asyncio.sleep(0.5)
-            await self._stream_screenshot(session_id, page, f"🔍 Loaded results for '{query}'")
-        except Exception as e:
-            logger.error(f"YouTube search navigation error: {e}")
-            return {"success": False, "error": f"YouTube navigation failed: {e}"}
-
-        # 2. Find and select the target video / playlist item
-        try:
-            # Wait for search results
-            await page.wait_for_selector(
-                "ytd-video-renderer, ytd-playlist-renderer, a#video-title, #video-title",
-                timeout=15000
-            )
-            # For playlist requests, select the playlist result itself first;
-            # only then select the requested item inside that playlist.
-            playlist_request = bool(re.search(r"\b(playlist|channel|madhil)\b", task_query, re.I))
-            playlist_elements = await page.query_selector_all(
-                "ytd-playlist-renderer a#video-title, ytd-playlist-renderer a#thumbnail"
-            )
-            valid_playlists = []
-            for element in playlist_elements:
-                try:
-                    title = (await element.inner_text()).strip()
-                    if title:
-                        valid_playlists.append((element, title))
-                except Exception:
-                    continue
-
-            elements = await page.query_selector_all("ytd-video-renderer a#video-title, a#video-title")
-            valid_videos = []
-            for element in elements:
-                try:
-                    title = (await element.inner_text()).strip()
-                    if title:
-                        valid_videos.append((element, title))
-                except Exception:
-                    continue
-
-            logger.info(
-                f"YouTube search found {len(valid_videos)} videos and {len(valid_playlists)} playlists"
-            )
-
-            chosen_from_playlist = playlist_request and bool(valid_playlists)
-            if chosen_from_playlist:
-                # Prefer a title containing the requested subject, otherwise
-                # the first playlist result is the deterministic fallback.
-                query_tokens = [token for token in query.lower().split() if len(token) > 2]
-                target_element, video_title = next(
-                    (
-                        (element, title)
-                        for element, title in valid_playlists
-                        if sum(token in title.lower() for token in query_tokens) >= max(1, min(2, len(query_tokens)))
-                    ),
-                    valid_playlists[0],
-                )
-                chosen_idx = 0
-            else:
-                valid_elements = valid_videos
-                if not valid_elements:
-                    return {
-                        "success": False,
-                        "error": f"No YouTube results found for '{query}'",
-                        "url": page.url,
-                    }
-                chosen_idx = target_index if target_index < len(valid_elements) else 0
-                target_element, video_title = valid_elements[chosen_idx]
-
-            # Highlight element
-            try:
-                await page.evaluate(
-                    """(el) => {
-                        if (el) {
-                            el.style.outline = '4px solid #ef4444';
-                            el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                        }
-                    }""",
-                    target_element,
-                )
-            except Exception:
-                pass
-
-            selection_label = f"playlist result: {video_title}" if chosen_from_playlist else f"video #{chosen_idx+1}: {video_title}"
-            await self._stream_screenshot(session_id, page, f"👆 Selecting {selection_label}")
-
-            # Click on the chosen video/playlist
-            await target_element.click()
-            await asyncio.sleep(1.0)
-
-            # 3. If navigated into a playlist overview page, select the
-            # requested video inside it (the user's ordinal applies here).
-            current_url = page.url
-            if "/playlist?list=" in current_url:
-                await self._stream_screenshot(session_id, page, f"📂 Playlist opened, selecting video #{target_index+1}")
-                try:
-                    await page.wait_for_selector(
-                        "ytd-playlist-video-renderer a#video-title, ytd-playlist-video-renderer a#thumbnail",
-                        timeout=10000,
-                    )
-                    pl_videos = await page.query_selector_all(
-                        "ytd-playlist-video-renderer a#video-title"
-                    )
-                    if not pl_videos:
-                        pl_videos = await page.query_selector_all(
-                            "ytd-playlist-video-renderer a#thumbnail"
-                        )
-                    if not pl_videos:
-                        return {"success": False, "error": "Playlist opened but contains no videos", "url": current_url}
-                    pl_idx = target_index if target_index < len(pl_videos) else 0
-                    await pl_videos[pl_idx].click()
-                    await asyncio.sleep(1.0)
-                except Exception as pl_err:
-                    logger.warning(f"Playlist sub-selection failed: {pl_err}")
-                    return {"success": False, "error": f"Could not select playlist video: {pl_err}", "url": page.url}
-
-            # 4. Trigger video playback & unpause.
-            try:
-                await page.wait_for_selector("video", timeout=10000)
-                playing = await page.evaluate(
-                    """async () => {
-                        const video = document.querySelector('video');
-                        if (!video) return false;
-                        video.muted = false;
-                        if (video.paused) {
-                            try { await video.play(); } catch (_) {}
-                        }
-                        const playBtn = document.querySelector('.ytp-play-button');
-                        if (video.paused && playBtn) playBtn.click();
-                        return !video.paused;
-                    }"""
-                )
-            except Exception as play_err:
-                logger.warning(f"YouTube playback trigger failed: {play_err}")
-                playing = False
-
-            await asyncio.sleep(0.7)
-            final_title = await page.title()
-            await self._stream_screenshot(session_id, page, f"▶️ Playing: {final_title}")
-            return {
-                "success": bool(playing),
-                "title": final_title,
-                "url": page.url,
-                "output": f"Now playing video #{target_index+1} ({video_title}) on YouTube" if playing else "Video opened but playback did not start",
-                "error": None if playing else "YouTube video opened but is paused",
-            }
-
-        except Exception as sel_err:
-            logger.warning(f"Interactive element selection error on YouTube: {sel_err}")
-
-        # Do not report success when the requested result could not be found;
-        # otherwise the UI claims the task ran while nothing was executed.
-        final_title = await page.title()
-        await self._stream_screenshot(session_id, page, f"YouTube: {final_title}")
-        return {"success": False, "title": final_title, "url": page.url, "error": "Could not locate the requested YouTube result"}
-
+    # All browser tasks use the generic live-Chrome agent above. Keeping no
+    # vendor-specific route here prevents one site's selectors or data model
+    # from changing how an unrelated website is automated.
     async def navigate(self, session_id: str, url: str) -> dict:
         """Navigate to a URL and stream a screenshot."""
         try:
@@ -1969,85 +1247,363 @@ IMPORTANT:
         task_query: str,
         session_id: str,
         start_url: Optional[str] = None,
+        task_id: str = "",
     ) -> dict:
         """
-        Run a full browser-use Agent task with user's selected Chrome profile.
-        Streams step updates and screenshots to the frontend.
+        Playwright-native LLM agent loop.
+        Replaces the browser-use Agent which deadlocks on Windows (CDP 30s timeout).
+        Uses the existing Playwright session (get_or_create_page) and drives the browser
+        step-by-step via llm_service.complete_json — no extra dependencies required.
         """
+        from app.services.llm_service import llm_service
+
+        cfg_max = getattr(settings, "max_agent_steps", 100)
+        max_steps = 1000 if cfg_max <= 0 else cfg_max
+        step_results: list[str] = []
+        successful_actions = 0
+        invalid_or_failed_streak = 0
+
+        # ── Ensure a Playwright page is available ─────────────────────────────
         try:
-            if bool(getattr(settings, "mcp_use_system_chrome", False)):
+            page = await self.get_or_create_page(session_id)
+        except Exception as page_err:
+            return {"success": False, "error": f"Could not start browser: {page_err}"}
+
+        async def _take_shot(label: str) -> str:
+            try:
+                await self._stream_screenshot(session_id, page, label)
+            except Exception:
+                pass
+            return page.url
+
+        async def _get_dom() -> str:
+            try:
+                return await page.evaluate(r"""
+                (() => {
+                  const tag = (el) => {
+                    const t = el.tagName.toLowerCase();
+                    const attrs = ['id','class','name','type','aria-label','placeholder','href','role','value','data-testid']
+                      .filter(a => el.getAttribute(a))
+                      .map(a => `${a}="${(el.getAttribute(a)||'').slice(0,60)}"`);
+                    const text = (el.innerText || el.textContent || el.value || '').trim().slice(0, 80);
+                    return `<${t} ${attrs.join(' ')}>${text}</${t}>`;
+                  };
+                  const els = Array.from(document.querySelectorAll(
+                    'a,button,input,select,textarea,h1,h2,h3,[role="button"],[role="link"],[role="option"],[role="menuitem"],[role="tab"],[role="dialog"],[role="alertdialog"],[aria-modal]'
+                  )).filter(el => {
+                    const r = el.getBoundingClientRect();
+                    return r.width > 0 && r.height > 0;
+                  }).slice(0, 80);
+                  return `URL: ${location.href}\nTitle: ${document.title}\n\n` + els.map(tag).join('\n');
+                })()
+                """)
+            except Exception as dom_err:
+                return f"URL: {page.url}\n(DOM snapshot failed: {dom_err})"
+
+        async def _get_visible_page_text() -> str:
+            try:
+                return await page.locator("body").inner_text(timeout=6000)
+            except Exception as page_text_err:
+                logger.debug(f"Playwright completion evidence read failed: {page_text_err}")
+                return ""
+
+        async def _dismiss_playwright_popups() -> list[str]:
+            """Dismiss non-transactional overlays without relying on a website name."""
+            try:
+                dismissed = await page.evaluate(r"""
+                    (() => {
+                      const visible = (el) => {
+                        if (!el) return false;
+                        const box = el.getBoundingClientRect();
+                        const style = getComputedStyle(el);
+                        return box.width > 20 && box.height > 15 && style.display !== 'none' &&
+                          style.visibility !== 'hidden' && style.opacity !== '0';
+                      };
+                      const transaction = /\b(?:payment|upi|qr\s*code|scan\s*(?:to\s*)?pay|otp|cvv|card number)\b/i;
+                      const scopes = Array.from(document.querySelectorAll([
+                        'dialog[open]', '[role="dialog"]', '[role="alertdialog"]', '[aria-modal="true"]',
+                        '[class*="modal" i]', '[class*="dialog" i]', '[class*="popup" i]',
+                        '[class*="consent" i]', '[class*="cookie" i]', '[class*="banner" i]',
+                        '[class*="overlay" i]', '[id*="consent" i]', '[id*="cookie" i]'
+                      ].join(','))).filter(visible).filter(scope => !transaction.test(scope.innerText || ''));
+                      if (!scopes.length) return null;
+
+                      const dismissLabels = new Set(['cancel', 'close', 'dismiss', 'not now', 'no thanks', 'reject', 'reject all', 'ok', 'okay']);
+                      const controls = 'button, [role="button"], a, input[type="button"], input[type="submit"]';
+                      const candidates = [];
+                      for (const scope of scopes) {
+                        const isConsent = /\b(?:cookie|consent|privacy|preferences)\b/i.test(scope.innerText || '');
+                        for (const control of scope.querySelectorAll(controls)) {
+                          if (!visible(control)) continue;
+                          const label = (control.innerText || control.value || control.getAttribute('aria-label') || '').trim().replace(/\s+/g, ' ');
+                          const normalized = label.toLowerCase();
+                          const isDismissal = dismissLabels.has(normalized);
+                          const isCookieAcceptance = isConsent && /^(?:accept|accept all|allow all|agree|i agree)$/i.test(label);
+                          if (!isDismissal && !isCookieAcceptance) continue;
+                          candidates.push({ control, label, score: (isDismissal ? 100 : 50) - label.length });
+                        }
+                      }
+                      if (!candidates.length) return null;
+                      candidates.sort((a, b) => b.score - a.score);
+                      candidates[0].control.scrollIntoView({ block: 'center', inline: 'center' });
+                      candidates[0].control.click();
+                      return candidates[0].label || 'popup';
+                    })()
+                """)
+                if dismissed:
+                    await page.wait_for_timeout(250)
+                    return [str(dismissed)]
+            except Exception as popup_err:
+                logger.debug(f"Playwright popup dismissal failed: {popup_err}")
+            return []
+
+        async def _handle_js_dialog(dialog) -> None:
+            """Accept ordinary alerts, but never advance a payment/OTP prompt."""
+            try:
+                prompt_text = str(dialog.message or "")
+                is_sensitive = _PAYMENT_PAGE_MARKERS.search(prompt_text) or re.search(
+                    r"\b(?:otp|cvv|card number)\b", prompt_text, re.IGNORECASE
+                )
+                if dialog.type == "prompt" or is_sensitive:
+                    await dialog.dismiss()
+                else:
+                    await dialog.accept()
+            except Exception as dialog_err:
+                logger.debug(f"Playwright JS dialog handling failed: {dialog_err}")
+
+        # Native JavaScript alerts/confirmations otherwise block all page actions.
+        page.on("dialog", lambda dialog: asyncio.create_task(_handle_js_dialog(dialog)))
+
+        # ── Step 0: Navigate to starting URL if given ─────────────────────────
+        last_url = page.url
+        if start_url and (start_url.startswith("http://") or start_url.startswith("https://")):
+            try:
+                verdict = security_guard.scan_url(start_url)
+                if not verdict.allowed:
+                    raise RuntimeError(f"URL blocked: {verdict.reason}")
+                await page.goto(start_url, wait_until="domcontentloaded", timeout=30000)
+                await asyncio.sleep(1.0)
+                last_url = await _take_shot(f"🌐 Opened: {start_url}")
+            except Exception as nav0_err:
+                logger.warning(f"Initial navigation to {start_url} failed: {nav0_err}")
+
+        logger.info(f"▶ Playwright agent starting — task='{task_query[:120]}' max_steps={max_steps}")
+
+        # ── Agent loop ────────────────────────────────────────────────────────
+        for step_num in range(1, max_steps + 1):
+            auto_dismissed = await _dismiss_playwright_popups()
+            if auto_dismissed:
+                step_results.append(f"Step {step_num}: auto-dismissed popup: {', '.join(auto_dismissed)}")
+                last_url = await _take_shot(f"🚫 Auto-dismissed: {', '.join(auto_dismissed[:2])}")
+            dom_context = await _get_dom()
+            history_summary = "\n".join(step_results[-5:])
+
+            agent_prompt = f"""You are an autonomous web automation agent controlling a real browser via Playwright.
+
+Original task: {task_query}
+
+What you have done so far:
+{history_summary or 'Nothing yet — this is step 1.'}
+
+Current browser state:
+{dom_context}
+
+Respond with EXACTLY ONE action in this JSON format (no prose, no markdown fences):
+{{"action": "<action_type>", "target": "<css_selector_or_url_or_text>", "value": "<text_to_type_if_applicable>", "reason": "<one_sentence_why>", "evidence": "<exact visible page text that proves done; required only for done>"}}
+
+Allowed action_types:
+- "navigate"  — go to a URL (target = full URL)
+- "click"     — click an element (target = CSS selector or visible button/link text)
+- "type"      — clear and type text (target = CSS selector of input, value = text)
+- "scroll"    — scroll page (target = "down" or "up")
+- "wait"      — pause (target = seconds as string, e.g. "2")
+- "read"      — extract visible text (target = CSS selector or "body")
+- "done"      — task complete (target = summary of what was accomplished)
+- "fail"      — task cannot be completed (target = reason why)
+
+CRITICAL RULES:
+- STOP before any payment/OTP/irreversible action — use "done" with a note
+- If a popup/modal/cookie banner is visible, dismiss it first with "click"
+- Never use "done" just because an action was sent. The visible page must prove the requested result; for a payment/QR/UPI/scan stopping point, that boundary must be visible.
+- For "done", set evidence to an exact short phrase currently visible on the page; do not invent it.
+- Prefer clicking by visible text label over complex CSS selectors
+- After navigating, always wait 1-2 seconds before the next action"""
+
+            action_data: dict = {}
+            try:
+                action_data = await asyncio.wait_for(
+                    llm_service.complete_json(agent_prompt),
+                    timeout=float(settings.agent_llm_timeout_seconds),
+                )
+            except Exception as llm_err:
+                logger.error(f"Agent LLM call failed at step {step_num}: {llm_err}")
+                break
+
+            if not action_data or "action" not in action_data:
+                step_results.append(f"Step {step_num}: (no action returned — skipped)")
+                invalid_or_failed_streak += 1
+                if invalid_or_failed_streak >= 3:
+                    return {
+                        "success": False,
+                        "error": "LLM returned no usable action three times; task stopped without claiming completion.",
+                        "url": last_url,
+                        "steps": step_num,
+                        "partial_progress": step_results,
+                    }
+                continue
+
+            action = str(action_data.get("action", "")).strip().lower()
+            target = str(action_data.get("target", ""))
+            value  = str(action_data.get("value", ""))
+            reason = str(action_data.get("reason", ""))
+            evidence = action_data.get("evidence", "")
+
+            logger.info(f"Agent step {step_num}: {action} | target={target[:80]} | {reason[:80]}")
+            step_results.append(f"Step {step_num}: {action} on '{target[:60]}' — {reason[:80]}")
+
+            if action == "done":
+                completion_reason = _completion_rejection_reason(
+                    task_query, target, evidence, await _get_visible_page_text(), successful_actions
+                )
+                if completion_reason:
+                    invalid_or_failed_streak += 1
+                    step_results.append(f"Step {step_num}: rejected premature completion — {completion_reason}")
+                    if invalid_or_failed_streak >= 3:
+                        return {
+                            "success": False,
+                            "error": f"Agent repeatedly claimed completion without proof: {completion_reason}",
+                            "url": last_url,
+                            "steps": step_num,
+                            "partial_progress": step_results,
+                        }
+                    continue
+                invalid_or_failed_streak = 0
+                last_url = await _take_shot(f"✅ Done (step {step_num}): {target[:60]}")
+                return {"success": True, "output": target, "url": last_url, "steps": step_num}
+
+            elif action == "fail":
+                last_url = await _take_shot(f"❌ Failed (step {step_num}): {target[:60]}")
+                return {"success": False, "error": target, "url": last_url, "steps": step_num}
+
+            elif action == "navigate":
+                try:
+                    verdict = security_guard.scan_url(target)
+                    if not verdict.allowed:
+                        raise RuntimeError(f"URL blocked: {verdict.reason}")
+                    await page.goto(target, wait_until="domcontentloaded", timeout=30000)
+                    await asyncio.sleep(1.5)
+                    last_url = await _take_shot(f"🌐 Step {step_num}: Navigated to {target[:50]}")
+                    successful_actions += 1
+                    invalid_or_failed_streak = 0
+                except Exception as e:
+                    step_results.append(f"  → navigate failed: {e}")
+                    invalid_or_failed_streak += 1
+
+            elif action == "click":
+                clicked = False
+                # Try CSS selector first, then visible text
+                try:
+                    await page.click(target, timeout=6000)
+                    clicked = True
+                except Exception:
+                    pass
+                if not clicked:
+                    try:
+                        await page.get_by_text(target, exact=False).first.click(timeout=6000)
+                        clicked = True
+                    except Exception:
+                        pass
+                if not clicked:
+                    try:
+                        await page.get_by_role("button", name=target).first.click(timeout=4000)
+                        clicked = True
+                    except Exception:
+                        pass
+                await asyncio.sleep(0.8)
+                last_url = await _take_shot(f"🖱 Step {step_num}: Clicked '{target[:40]}'")
+                if not clicked:
+                    step_results.append(f"  → click failed: element not found")
+                    invalid_or_failed_streak += 1
+                else:
+                    successful_actions += 1
+                    invalid_or_failed_streak = 0
+
+            elif action == "type":
+                if not _is_explicitly_authorized_form_value(task_query, target, value):
+                    invalid_or_failed_streak += 1
+                    step_results.append(f"Step {step_num}: blocked unsafe form entry for '{target[:60]}'")
+                    if invalid_or_failed_streak >= 3:
+                        return {
+                            "success": False,
+                            "error": "Refusing to invent personal or payment information not supplied in the task",
+                            "url": last_url,
+                            "steps": step_num,
+                            "partial_progress": step_results,
+                        }
+                    continue
+                try:
+                    await page.fill(target, "")
+                    await page.type(target, value, delay=40)
+                    await asyncio.sleep(0.5)
+                    successful_actions += 1
+                    invalid_or_failed_streak = 0
+                except Exception as e:
+                    try:
+                        await page.get_by_placeholder(target).fill(value)
+                        successful_actions += 1
+                        invalid_or_failed_streak = 0
+                    except Exception:
+                        try:
+                            await page.get_by_label(target, exact=False).fill(value)
+                            successful_actions += 1
+                            invalid_or_failed_streak = 0
+                        except Exception:
+                            step_results.append(f"  → type failed: {e}")
+                            invalid_or_failed_streak += 1
+                last_url = await _take_shot(f"⌨️ Step {step_num}: Typed into '{target[:40]}'")
+
+            elif action == "scroll":
+                direction = 1 if (target or "down").lower() != "up" else -1
+                await page.evaluate(f"window.scrollBy(0, {direction * 600})")
+                await asyncio.sleep(0.5)
+                last_url = await _take_shot(f"↕ Step {step_num}: Scrolled {target or 'down'}")
+                successful_actions += 1
+                invalid_or_failed_streak = 0
+
+            elif action == "wait":
+                secs = min(float(target or "2"), 10.0)
+                await asyncio.sleep(secs)
+                last_url = await _take_shot(f"⏳ Step {step_num}: Waited {secs}s")
+                invalid_or_failed_streak = 0
+
+            elif action == "read":
+                try:
+                    text = await page.inner_text(target if target else "body")
+                    step_results.append(f"  → read: {text[:200]}")
+                    successful_actions += 1
+                    invalid_or_failed_streak = 0
+                except Exception as e:
+                    step_results.append(f"  → read failed: {e}")
+                    invalid_or_failed_streak += 1
+
+            else:
+                invalid_or_failed_streak += 1
+
+            if invalid_or_failed_streak >= 3:
                 return {
                     "success": False,
-                    "error": "Live Chrome bridge is required for system-Chrome automation; copied profiles are disabled",
+                    "error": "Agent made three consecutive invalid or failed actions; stopping instead of falsely completing.",
+                    "url": last_url,
+                    "steps": step_num,
+                    "partial_progress": step_results,
                 }
-            from browser_use import Agent, BrowserProfile
-        except ImportError:
-            logger.error("browser-use package is not installed.")
-            return {"success": False, "error": "browser-use is not installed"}
 
-        llm = _get_browser_use_llm()
-        if not llm:
-            logger.warning("No LLM configured for browser-use Agent; cannot complete an interactive task.")
-            return {
-                "success": False,
-                "error": "No browser-agent LLM is configured for this interactive task",
-            }
-
-        use_system_profile = bool(getattr(settings, "mcp_use_system_chrome", False))
-        if use_system_profile:
-            user_data_dir = _get_chrome_user_data_dir()
-            profile_name = _get_active_profile_name()
-            exe_path = _find_chrome_executable()
-        else:
-            user_data_dir = _get_dedicated_profile_dir(session_id)
-            profile_name = "Default"
-            exe_path = None
-
-        profile = BrowserProfile(
-            user_data_dir=str(user_data_dir),
-            profile_directory=profile_name,
-            executable_path=exe_path,
-            channel=None if exe_path else "chromium",
-            headless=False,
-            highlight_elements=True,
-            keep_alive=True,
-        )
-
-        async def step_callback(state, output, step_num):
-            try:
-                if hasattr(state, "screenshot") and state.screenshot:
-                    b64 = state.screenshot
-                    if isinstance(b64, bytes):
-                        b64 = base64.b64encode(b64).decode("utf-8")
-                    await manager.send_to_session(session_id, {
-                        "type": "viewport_screenshot",
-                        "label": f"Step {step_num}: {getattr(output, 'current_state', '')}",
-                        "data": b64,
-                        "format": "jpeg",
-                        "timestamp": datetime.utcnow().isoformat(),
-                    })
-            except Exception as cb_err:
-                logger.debug(f"Step callback error: {cb_err}")
-
-        try:
-            logger.info(f"Running browser-use Agent for task: '{task_query}' with profile '{profile_name}'")
-            agent_task = task_query
-            if start_url:
-                agent_task = f"Start at {start_url}. Then complete this task: {task_query}"
-            agent = Agent(
-                task=agent_task,
-                llm=llm,
-                browser_profile=profile,
-                use_vision=False,
-                register_new_step_callback=step_callback,
-            )
-            history = await agent.run()
-            result_text = str(history)
-            logger.info(f"✅ browser-use Agent completed task: {result_text[:200]}")
-            return {"success": True, "output": result_text}
-        except Exception as e:
-            logger.error(f"browser-use Agent task failed: {e}", exc_info=True)
-            return {"success": False, "error": f"Browser agent failed: {e}"}
+        return {
+            "success": False,
+            "error": f"Agent reached max steps ({max_steps}) without completing the task",
+            "url": last_url,
+            "steps": max_steps,
+        }
 
     async def click_element(self, session_id: str, selector: str, description: str = "") -> dict:
         """Click an element with visual highlight."""

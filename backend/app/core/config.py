@@ -48,6 +48,29 @@ class Settings(BaseSettings):
     gemini_api_keys: str = Field(default="")
     openai_api_key: str = Field(default="")
     openai_api_keys: str = Field(default="")
+    openai_model: str = Field(default="gpt-4o")
+    groq_api_key: str = Field(default="")
+    groq_api_keys: str = Field(default="")
+    groq_model: str = Field(default="openai/gpt-oss-120b")
+    nvidia_api_key: str = Field(default="")
+    nvidia_api_keys: str = Field(default="")
+    nvidia_model: str = Field(default="meta/llama-3.2-11b-vision-instruct")
+    llm_use_keyring: bool = Field(
+        default=False,
+        description="Read fallback API keys from the OS keychain; disabled by default to keep startup fast.",
+    )
+    llm_attempt_timeout_seconds: float = Field(
+        default=8.0,
+        ge=1.0,
+        le=60.0,
+        description="Maximum time to wait for one LLM key before rotating to the next healthy key.",
+    )
+    agent_llm_timeout_seconds: float = Field(
+        default=35.0,
+        ge=5.0,
+        le=120.0,
+        description="Total time budget for one browser-agent decision across all LLM fallback keys.",
+    )
 
     # Security
     secret_key: str = Field(default=_WEAK_SECRET_KEY)
@@ -76,6 +99,10 @@ class Settings(BaseSettings):
     # Execution mode — default is Human-in-the-Loop for safety
     # Can be overridden per-session in the UI
     default_execution_mode: str = Field(default="hitl")
+    max_agent_steps: int = Field(
+        default=100,
+        description="Max steps for autonomous agents (0 for practically unlimited until task completes or token expires)",
+    )
 
     # MCP Browser Automation (Phase 5)
     mcp_browser_profile_dir: str = Field(

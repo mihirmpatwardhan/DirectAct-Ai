@@ -103,6 +103,8 @@ class LiveChromeBridge:
                         else:
                             logger.info(f"Live Chrome extension fully verified (v{version})")
                         await self._send({"type": "hello_ack", "request_id": message.get("request_id")})
+                elif message.get("type") == "ping":
+                    await self._send({"type": "pong"}, require_ready=False)
         except (WebSocketDisconnect, RuntimeError, json.JSONDecodeError):
             pass
         finally:

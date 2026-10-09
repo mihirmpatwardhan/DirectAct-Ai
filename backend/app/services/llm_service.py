@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -209,30 +210,43 @@ class GeminiProvider(LLMProvider):
     ]
 
     def __init__(self, api_key: str):
-        import google.generativeai as genai
         self._api_key = api_key
         self._key_hint = api_key[-8:] if len(api_key) >= 8 else "***"
         self._client = None
         self._model_name = None
+        self._initialization_error: Optional[Exception] = None
 
-        genai.configure(api_key=api_key)
-        for model_name in self.CANDIDATE_MODELS:
-            try:
-                client = genai.GenerativeModel(
-                    model_name=model_name,
-                    system_instruction=SYSTEM_PROMPT,
-                    generation_config={
-                        "temperature": 0.7,
-                        "max_output_tokens": 2048,
-                        "top_p": 0.95,
-                    },
-                )
-                self._client = client
-                self._model_name = model_name
-                logger.info(f"GeminiProvider: initialized ({model_name}, key=...{self._key_hint})")
-                break
-            except Exception as e:
-                logger.debug(f"GeminiProvider: model {model_name} unavailable: {e}")
+    def _ensure_client(self) -> None:
+        """Import and configure the heavy SDK only when this key is selected."""
+        if self._client is not None:
+            return
+        if self._initialization_error is not None:
+            raise RuntimeError("Gemini client initialization previously failed") from self._initialization_error
+
+        try:
+            import google.generativeai as genai
+            genai.configure(api_key=self._api_key)
+            for model_name in self.CANDIDATE_MODELS:
+                try:
+                    client = genai.GenerativeModel(
+                        model_name=model_name,
+                        system_instruction=SYSTEM_PROMPT,
+                        generation_config={
+                            "temperature": 0.7,
+                            "max_output_tokens": 2048,
+                            "top_p": 0.95,
+                        },
+                    )
+                    self._client = client
+                    self._model_name = model_name
+                    logger.info(f"GeminiProvider: initialized ({model_name}, key=...{self._key_hint})")
+                    return
+                except Exception as error:
+                    logger.debug(f"GeminiProvider: model {model_name} unavailable: {error}")
+            raise RuntimeError("No Gemini model could be initialized")
+        except Exception as error:
+            self._initialization_error = error
+            raise
 
     @property
     def provider_name(self) -> str:
@@ -240,7 +254,7 @@ class GeminiProvider(LLMProvider):
 
     @property
     def is_available(self) -> bool:
-        return self._client is not None
+        return self._initialization_error is None
 
     async def stream(
         self,
@@ -248,7 +262,7 @@ class GeminiProvider(LLMProvider):
         user_message: str,
     ) -> AsyncIterator[str]:
         if not self._client:
-            raise RuntimeError("Gemini client not initialized")
+            self._ensure_client()
         try:
             gemini_history = [
                 {"role": "user" if m["role"] == "user" else "model",
@@ -270,7 +284,7 @@ class GeminiProvider(LLMProvider):
 
     async def complete(self, prompt: str, max_tokens: int = 512, temperature: float = 0.2) -> str:
         if not self._client:
-            raise RuntimeError("Gemini client not initialized")
+            self._ensure_client()
         loop = asyncio.get_event_loop()
         retries = 3
         backoff = 1.0
@@ -303,12 +317,25 @@ class GeminiProvider(LLMProvider):
 class OpenAIProvider(LLMProvider):
     """OpenAI GPT implementation using the openai async SDK."""
 
-    def __init__(self, api_key: str):
-        from openai import AsyncOpenAI
+    def __init__(self, api_key: str, model: Optional[str] = None):
         self._key_hint = api_key[-8:] if len(api_key) >= 8 else "***"
-        self._client = AsyncOpenAI(api_key=api_key)
-        self._model = "gpt-4o-mini"
-        logger.info(f"OpenAIProvider: initialized (model={self._model}, key=...{self._key_hint})")
+        self._api_key = api_key
+        self._client = None
+        self._initialization_error: Optional[Exception] = None
+        self._model = model or getattr(settings, "openai_model", None) or os.getenv("OPENAI_MODEL") or "gpt-4o"
+
+    def _ensure_client(self) -> None:
+        if self._client is not None:
+            return
+        if self._initialization_error is not None:
+            raise RuntimeError("OpenAI client initialization previously failed") from self._initialization_error
+        try:
+            from openai import AsyncOpenAI
+            self._client = AsyncOpenAI(api_key=self._api_key)
+            logger.info(f"OpenAIProvider: initialized (model={self._model}, key=...{self._key_hint})")
+        except Exception as error:
+            self._initialization_error = error
+            raise
 
     @property
     def provider_name(self) -> str:
@@ -316,13 +343,14 @@ class OpenAIProvider(LLMProvider):
 
     @property
     def is_available(self) -> bool:
-        return self._client is not None
+        return self._initialization_error is None
 
     async def stream(
         self,
         history: List[Dict[str, str]],
         user_message: str,
     ) -> AsyncIterator[str]:
+        self._ensure_client()
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
         messages.extend({"role": m["role"], "content": m["content"]} for m in history)
         messages.append({"role": "user", "content": user_message})
@@ -340,6 +368,169 @@ class OpenAIProvider(LLMProvider):
                 yield delta.content
 
     async def complete(self, prompt: str, max_tokens: int = 512, temperature: float = 0.2) -> str:
+        self._ensure_client()
+        resp = await self._client.chat.completions.create(
+            model=self._model,
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"},
+            max_tokens=max_tokens,
+            temperature=temperature,
+        )
+        return resp.choices[0].message.content or ""
+
+    async def complete_json(self, prompt: str) -> dict:
+        text = await self.complete(prompt, max_tokens=1024, temperature=0.1)
+        return _extract_json(text)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Groq Provider (Ultra-fast LPU inference via OpenAI-compatible API)
+# ──────────────────────────────────────────────────────────────────────────────
+
+class GroqProvider(LLMProvider):
+    """Groq Cloud LPU implementation using AsyncOpenAI with Groq base URL."""
+
+    CANDIDATE_MODELS = [
+        "openai/gpt-oss-120b",
+        "openai/gpt-oss-20b",
+        "llama-3.3-70b-versatile",
+        "llama-3.1-8b-instant",
+        "qwen/qwen3.8-27b",
+        "mixtral-8x7b-32768",
+    ]
+
+    def __init__(self, api_key: str, model: Optional[str] = None):
+        self._key_hint = api_key[-8:] if len(api_key) >= 8 else "***"
+        self._api_key = api_key
+        self._client = None
+        self._initialization_error: Optional[Exception] = None
+        self._model = model or getattr(settings, "groq_model", None) or self.CANDIDATE_MODELS[0]
+
+    def _ensure_client(self) -> None:
+        if self._client is not None:
+            return
+        if self._initialization_error is not None:
+            raise RuntimeError("Groq client initialization previously failed") from self._initialization_error
+        try:
+            from openai import AsyncOpenAI
+            self._client = AsyncOpenAI(api_key=self._api_key, base_url="https://api.groq.com/openai/v1")
+            logger.info(f"GroqProvider: initialized (model={self._model}, key=...{self._key_hint})")
+        except Exception as error:
+            self._initialization_error = error
+            raise
+
+    @property
+    def provider_name(self) -> str:
+        return f"groq/{self._model}"
+
+    @property
+    def is_available(self) -> bool:
+        return self._initialization_error is None
+
+    async def stream(
+        self,
+        history: List[Dict[str, str]],
+        user_message: str,
+    ) -> AsyncIterator[str]:
+        self._ensure_client()
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        messages.extend({"role": m["role"], "content": m["content"]} for m in history)
+        messages.append({"role": "user", "content": user_message})
+
+        stream = await self._client.chat.completions.create(
+            model=self._model,
+            messages=messages,
+            stream=True,
+            max_tokens=2048,
+            temperature=0.7,
+        )
+        async for chunk in stream:
+            delta = chunk.choices[0].delta
+            if delta.content:
+                yield delta.content
+
+    async def complete(self, prompt: str, max_tokens: int = 512, temperature: float = 0.2) -> str:
+        self._ensure_client()
+        resp = await self._client.chat.completions.create(
+            model=self._model,
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"},
+            max_tokens=max_tokens,
+            temperature=temperature,
+        )
+        return resp.choices[0].message.content or ""
+
+    async def complete_json(self, prompt: str) -> dict:
+        text = await self.complete(prompt, max_tokens=1024, temperature=0.1)
+        return _extract_json(text)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# NVIDIA NIM Provider (Fast inference via OpenAI-compatible API)
+# ──────────────────────────────────────────────────────────────────────────────
+
+class NvidiaProvider(LLMProvider):
+    """NVIDIA NIM implementation using AsyncOpenAI with NVIDIA base URL."""
+
+    CANDIDATE_MODELS = [
+        "meta/llama-3.2-11b-vision-instruct",
+        "mistralai/mistral-7b-instruct-v0.3",
+        "deepseek-ai/deepseek-v4.1-flash",
+        "ibm/granite-3.0-8b-instruct",
+    ]
+
+    def __init__(self, api_key: str, model: Optional[str] = None):
+        self._key_hint = api_key[-8:] if len(api_key) >= 8 else "***"
+        self._api_key = api_key
+        self._client = None
+        self._initialization_error: Optional[Exception] = None
+        self._model = model or getattr(settings, "nvidia_model", None) or self.CANDIDATE_MODELS[0]
+
+    def _ensure_client(self) -> None:
+        if self._client is not None:
+            return
+        if self._initialization_error is not None:
+            raise RuntimeError("NVIDIA client initialization previously failed") from self._initialization_error
+        try:
+            from openai import AsyncOpenAI
+            self._client = AsyncOpenAI(api_key=self._api_key, base_url="https://integrate.api.nvidia.com/v1")
+            logger.info(f"NvidiaProvider: initialized (model={self._model}, key=...{self._key_hint})")
+        except Exception as error:
+            self._initialization_error = error
+            raise
+
+    @property
+    def provider_name(self) -> str:
+        return f"nvidia/{self._model}"
+
+    @property
+    def is_available(self) -> bool:
+        return self._initialization_error is None
+
+    async def stream(
+        self,
+        history: List[Dict[str, str]],
+        user_message: str,
+    ) -> AsyncIterator[str]:
+        self._ensure_client()
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        messages.extend({"role": m["role"], "content": m["content"]} for m in history)
+        messages.append({"role": "user", "content": user_message})
+
+        stream = await self._client.chat.completions.create(
+            model=self._model,
+            messages=messages,
+            stream=True,
+            max_tokens=2048,
+            temperature=0.7,
+        )
+        async for chunk in stream:
+            delta = chunk.choices[0].delta
+            if delta.content:
+                yield delta.content
+
+    async def complete(self, prompt: str, max_tokens: int = 512, temperature: float = 0.2) -> str:
+        self._ensure_client()
         resp = await self._client.chat.completions.create(
             model=self._model,
             messages=[{"role": "user", "content": prompt}],
@@ -408,7 +599,14 @@ class StubProvider(LLMProvider):
         return '{"task_type": "query", "confidence": 0.5, "intent": "stub", "parameters": {}, "requires_approval": false}'
 
     async def complete_json(self, prompt: str) -> dict:
-        return {"action": "done", "target": "stub", "status": "completed"}
+        # A development fallback must never claim that a browser task finished.
+        # Returning `done` here was the direct cause of false green task cards
+        # whenever no real provider/key was usable.
+        return {
+            "action": "fail",
+            "target": "No usable LLM provider is configured; automation was not started.",
+            "status": "unavailable",
+        }
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -421,6 +619,10 @@ class KeyRotationManager:
 
     def __init__(self):
         self._providers: List[tuple[LLMProvider, KeyCircuitBreaker]] = []
+        # Advance the preferred entry after every attempt.  This balances a
+        # healthy key pool and, more importantly, makes a failed key's
+        # replacement immediate instead of repeatedly selecting index zero.
+        self._next_index = 0
 
     def register(self, provider: LLMProvider, key: str):
         hint = key[-8:] if len(key) >= 8 else "***"
@@ -428,15 +630,43 @@ class KeyRotationManager:
         self._providers.append((provider, cb))
         logger.info(f"KeyRotationManager: registered {provider.provider_name} key=...{hint}")
 
-    def get_available(self) -> Optional[tuple[LLMProvider, KeyCircuitBreaker]]:
-        """Return the first available provider+breaker pair."""
-        for provider, cb in self._providers:
-            if cb.is_available:
+    def get_available(
+        self, excluded: Optional[set[int]] = None
+    ) -> Optional[tuple[LLMProvider, KeyCircuitBreaker]]:
+        """Return the next healthy provider, skipping entries already tried."""
+        if not self._providers:
+            return None
+
+        excluded = excluded or set()
+        total = len(self._providers)
+        for offset in range(total):
+            index = (self._next_index + offset) % total
+            provider, cb = self._providers[index]
+            if index not in excluded and cb.is_available:
                 return provider, cb
         return None
 
+    def index_of(self, breaker: KeyCircuitBreaker) -> Optional[int]:
+        for index, (_, cb) in enumerate(self._providers):
+            if cb is breaker:
+                return index
+        return None
+
+    def available_attempts(self):
+        """Yield each currently healthy key at most once, in rotation order."""
+        attempted: set[int] = set()
+        while pair := self.get_available(attempted):
+            index = self.index_of(pair[1])
+            if index is None:
+                return
+            attempted.add(index)
+            yield pair
+
     def mark_success(self, cb: KeyCircuitBreaker):
         cb.record_success()
+        index = self.index_of(cb)
+        if index is not None and self._providers:
+            self._next_index = (index + 1) % len(self._providers)
 
     def mark_failure(self, cb: KeyCircuitBreaker, is_quota: bool = False):
         cb.record_failure(is_quota_error=is_quota)
@@ -452,42 +682,74 @@ class KeyRotationManager:
 # LLM Service — unified entry point
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _load_keys_from_env() -> tuple[List[str], List[str]]:
+def _load_keys_from_env() -> tuple[List[str], List[str], List[str], List[str]]:
     """Load API keys from .env settings.
     In production these would come from OS keychain via the `keyring` library.
     The keyring integration stub is below — enable when keys are in keychain."""
     gemini_keys = []
     openai_keys = []
+    groq_keys = []
+    nvidia_keys = []
 
-    # Primary key from .env
-    if settings.gemini_api_key and settings.gemini_api_key not in (
-        "your_gemini_api_key_here", "", "YOUR_KEY_HERE"
-    ):
-        gemini_keys.append(settings.gemini_api_key)
+    def add_configured(target: List[str], primary: str, pool: str, placeholders: set[str]):
+        """Add a primary key plus every valid comma-separated fallback key."""
+        for value in (primary, *(pool or "").split(",")):
+            key = (value or "").strip()
+            if key and key not in placeholders:
+                target.append(key)
 
-    if settings.openai_api_key and settings.openai_api_key not in (
-        "your_openai_api_key_here", "", "YOUR_KEY_HERE"
-    ):
-        openai_keys.append(settings.openai_api_key)
+    # Primary key plus every configured fallback.  Gemini/OpenAI pools were
+    # previously declared in Settings but never loaded, so their fallbacks
+    # silently did nothing.
+    add_configured(
+        gemini_keys, settings.gemini_api_key, settings.gemini_api_keys,
+        {"your_gemini_api_key_here", "YOUR_KEY_HERE"},
+    )
+    add_configured(
+        openai_keys, settings.openai_api_key, settings.openai_api_keys,
+        {"your_openai_api_key_here", "YOUR_KEY_HERE"},
+    )
+    add_configured(
+        groq_keys, settings.groq_api_key, settings.groq_api_keys,
+        {"your_groq_api_key_here", "YOUR_KEY_HERE"},
+    )
+    add_configured(
+        nvidia_keys, settings.nvidia_api_key, settings.nvidia_api_keys,
+        {"your_nvidia_api_key_here", "YOUR_KEY_HERE"},
+    )
 
-    # OS keychain lookup (production path)
-    # Requires: pip install keyring
-    try:
-        import keyring
-        for i in range(1, 6):  # Support up to 5 pooled keys per provider
-            gkey = keyring.get_password("directact-ai", f"gemini_api_key_{i}")
-            if gkey:
-                gemini_keys.append(gkey)
-            okey = keyring.get_password("directact-ai", f"openai_api_key_{i}")
-            if okey:
-                openai_keys.append(okey)
-    except ImportError:
-        logger.debug("keyring not installed — OS keychain integration disabled. pip install keyring to enable.")
-    except Exception as e:
-        logger.warning(f"OS keychain lookup failed: {e}")
+    # Credential Manager can block for many seconds on some Windows setups.
+    # Environment-configured keys are the normal fast path, so only query the
+    # keychain when the user explicitly opts in.
+    use_keyring = bool(getattr(settings, "llm_use_keyring", False))
+    if use_keyring:
+        try:
+            import keyring
+            for i in range(1, 6):  # Support up to 5 pooled keys per provider
+                gkey = keyring.get_password("directact-ai", f"gemini_api_key_{i}")
+                if gkey:
+                    gemini_keys.append(gkey)
+                okey = keyring.get_password("directact-ai", f"openai_api_key_{i}")
+                if okey:
+                    openai_keys.append(okey)
+                groq_key = keyring.get_password("directact-ai", f"groq_api_key_{i}")
+                if groq_key:
+                    groq_keys.append(groq_key)
+                nvidia_key = keyring.get_password("directact-ai", f"nvidia_api_key_{i}")
+                if nvidia_key:
+                    nvidia_keys.append(nvidia_key)
+        except ImportError:
+            logger.debug("keyring not installed — OS keychain integration disabled. pip install keyring to enable.")
+        except Exception as e:
+            logger.warning(f"OS keychain lookup failed: {e}")
 
     # Deduplicate
-    return list(dict.fromkeys(gemini_keys)), list(dict.fromkeys(openai_keys))
+    return (
+        list(dict.fromkeys(gemini_keys)),
+        list(dict.fromkeys(openai_keys)),
+        list(dict.fromkeys(groq_keys)),
+        list(dict.fromkeys(nvidia_keys)),
+    )
 
 
 class LLMService:
@@ -504,30 +766,70 @@ class LLMService:
         self._init_providers()
 
     def _init_providers(self):
-        gemini_keys, openai_keys = _load_keys_from_env()
+        gemini_keys, openai_keys, groq_keys, nvidia_keys = _load_keys_from_env()
 
-        # Register Gemini keys
-        for key in gemini_keys:
-            try:
-                provider = GeminiProvider(key)
-                if provider.is_available:
-                    self._rotation_manager.register(provider, key)
-            except Exception as e:
-                logger.warning(f"Failed to initialize Gemini provider: {e}")
+        def _reg_nvidia():
+            for key in nvidia_keys:
+                try:
+                    provider = NvidiaProvider(key)
+                    if provider.is_available:
+                        self._rotation_manager.register(provider, key)
+                except Exception as e:
+                    logger.warning(f"Failed to initialize Nvidia provider: {e}")
 
-        # Register OpenAI keys
-        for key in openai_keys:
-            try:
-                provider = OpenAIProvider(key)
-                if provider.is_available:
-                    self._rotation_manager.register(provider, key)
-            except Exception as e:
-                logger.warning(f"Failed to initialize OpenAI provider: {e}")
+        def _reg_groq():
+            for key in groq_keys:
+                try:
+                    provider = GroqProvider(key)
+                    if provider.is_available:
+                        self._rotation_manager.register(provider, key)
+                except Exception as e:
+                    logger.warning(f"Failed to initialize Groq provider: {e}")
+
+        def _reg_gemini():
+            for key in gemini_keys:
+                try:
+                    provider = GeminiProvider(key)
+                    if provider.is_available:
+                        self._rotation_manager.register(provider, key)
+                except Exception as e:
+                    logger.warning(f"Failed to initialize Gemini provider: {e}")
+
+        def _reg_openai():
+            for key in openai_keys:
+                try:
+                    provider = OpenAIProvider(key)
+                    if provider.is_available:
+                        self._rotation_manager.register(provider, key)
+                except Exception as e:
+                    logger.warning(f"Failed to initialize OpenAI provider: {e}")
+
+        pref = (settings.llm_provider or "").lower()
+        if pref == "nvidia" or (nvidia_keys and not groq_keys and not gemini_keys and not openai_keys):
+            _reg_nvidia()
+            _reg_groq()
+            _reg_gemini()
+            _reg_openai()
+        elif pref == "groq" or (groq_keys and not gemini_keys and not openai_keys):
+            _reg_groq()
+            _reg_nvidia()
+            _reg_gemini()
+            _reg_openai()
+        elif pref == "openai":
+            _reg_openai()
+            _reg_nvidia()
+            _reg_groq()
+            _reg_gemini()
+        else:
+            _reg_gemini()
+            _reg_nvidia()
+            _reg_groq()
+            _reg_openai()
 
         if not self._rotation_manager.has_any_available:
             logger.warning(
                 "⚠️ No LLM API keys configured — using stub responses. "
-                "Set GEMINI_API_KEY or OPENAI_API_KEY in backend/.env"
+                "Set NVIDIA_API_KEY, GROQ_API_KEY, GEMINI_API_KEY, or OPENAI_API_KEY in backend/.env"
             )
         else:
             logger.info(f"✅ LLM Service ready with {len(self._rotation_manager._providers)} key(s)")
@@ -558,37 +860,26 @@ class LLMService:
         user_message: str,
     ) -> AsyncIterator[str]:
         """Stream LLM response with automatic key rotation on failure."""
-        pair = self._rotation_manager.get_available()
-        if not pair:
+        attempts = list(self._rotation_manager.available_attempts())
+        if not attempts:
             async for chunk in self._stub.stream(history, user_message):
                 yield chunk
             return
 
-        provider, cb = pair
-        try:
-            async for chunk in provider.stream(history, user_message):
-                yield chunk
-            self._rotation_manager.mark_success(cb)
-        except Exception as e:
-            is_quota = any(kw in str(e).lower() for kw in ["quota", "rate limit", "429", "resource exhausted"])
-            self._rotation_manager.mark_failure(cb, is_quota=is_quota)
-            logger.warning(f"Provider {provider.provider_name} failed, attempting fallback: {e}")
+        failures: list[str] = []
+        for provider, cb in attempts:
+            try:
+                async for chunk in provider.stream(history, user_message):
+                    yield chunk
+                self._rotation_manager.mark_success(cb)
+                return
+            except Exception as error:
+                is_quota = _is_quota_error(error)
+                self._rotation_manager.mark_failure(cb, is_quota=is_quota)
+                failures.append(str(error))
+                logger.warning("Provider %s failed while streaming; rotating immediately: %s", provider.provider_name, error)
 
-            # Try next available key
-            next_pair = self._rotation_manager.get_available()
-            if next_pair and next_pair[0] is not provider:
-                next_provider, next_cb = next_pair
-                try:
-                    async for chunk in next_provider.stream(history, user_message):
-                        yield chunk
-                    self._rotation_manager.mark_success(next_cb)
-                    return
-                except Exception as e2:
-                    self._rotation_manager.mark_failure(next_cb)
-                    logger.error(f"Fallback provider also failed: {e2}")
-
-            # Last resort: stub with error message
-            yield f"\n\n⚠️ *LLM error: {str(e)[:200]}. Check your API key configuration.*"
+        yield f"\n\n⚠️ *Every configured LLM key failed: {failures[-1][:200] if failures else 'unknown error'}.*"
 
     async def classify_intent(self, user_input: str) -> dict:
         """Use LLM to classify user input when rule-based router is ambiguous."""
@@ -600,56 +891,67 @@ class LLMService:
             '"requires_approval": false}\n\n'
             f'User Input: "{user_input}"'
         )
-        pair = self._rotation_manager.get_available()
-        if not pair:
+        attempts = list(self._rotation_manager.available_attempts())
+        if not attempts:
             return {"task_type": "query", "confidence": 0.5, "intent": user_input[:80],
                     "parameters": {}, "requires_approval": False}
 
-        provider, cb = pair
-        try:
-            text = await provider.complete(prompt, max_tokens=300, temperature=0.1)
-            # Strip markdown code fences if present
-            if text.startswith("```"):
-                parts = text.split("```")
-                text = parts[1].lstrip("json").strip() if len(parts) > 1 else text
-            result = json.loads(text.strip())
-            self._rotation_manager.mark_success(cb)
-            return result
-        except Exception as e:
-            self._rotation_manager.mark_failure(cb)
-            logger.error(f"LLM intent classification error: {e}")
-            return {"task_type": "query", "confidence": 0.5, "intent": user_input[:80],
-                    "parameters": {}, "requires_approval": False}
+        for provider, cb in attempts:
+            try:
+                text = await asyncio.wait_for(
+                    provider.complete(prompt, max_tokens=300, temperature=0.1),
+                    timeout=float(settings.llm_attempt_timeout_seconds),
+                )
+                result = _extract_json(text)
+                if not result:
+                    raise ValueError("Provider returned no valid JSON object")
+                self._rotation_manager.mark_success(cb)
+                return result
+            except Exception as error:
+                self._rotation_manager.mark_failure(cb, is_quota=_is_quota_error(error))
+                logger.warning("Provider %s failed to classify intent; rotating immediately: %s", provider.provider_name, error)
+
+        return {"task_type": "query", "confidence": 0.5, "intent": user_input[:80],
+                "parameters": {}, "requires_approval": False}
 
     async def complete_json(self, prompt: str, timeout: float = 60.0) -> dict:
-        """Complete a prompt constrained to JSON with rotation across providers/keys."""
-        pair = self._rotation_manager.get_available()
-        if not pair:
+        """Complete JSON, trying every healthy key/provider within one deadline."""
+        if not self._rotation_manager.has_any_available:
             return await self._stub.complete_json(prompt)
 
-        provider, cb = pair
-        try:
-            res = await asyncio.wait_for(provider.complete_json(prompt), timeout=timeout)
-            if res:
+        started = time.monotonic()
+        attempted = 0
+        attempts = list(self._rotation_manager.available_attempts())
+        for position, (provider, cb) in enumerate(attempts):
+            remaining = timeout - (time.monotonic() - started)
+            if remaining <= 0:
+                break
+            # Divide the remaining deadline fairly across every healthy
+            # fallback rather than letting the first slow key consume the
+            # whole browser step. The final fallback receives whatever is
+            # left, while the per-key cap keeps a dead endpoint from stalling
+            # the agent.
+            remaining_attempts = len(attempts) - position
+            fair_share = remaining / remaining_attempts
+            per_attempt_timeout = min(
+                float(settings.llm_attempt_timeout_seconds), remaining, fair_share
+            )
+            attempted += 1
+            try:
+                result = await asyncio.wait_for(
+                    provider.complete_json(prompt), timeout=per_attempt_timeout
+                )
+                if not isinstance(result, dict) or not result:
+                    raise ValueError("Provider returned no valid JSON object")
                 self._rotation_manager.mark_success(cb)
-                return res
-        except Exception as e:
-            is_quota = _is_quota_error(e)
-            self._rotation_manager.mark_failure(cb, is_quota=is_quota)
-            logger.warning(f"Provider {provider.provider_name} complete_json failed: {e}. Attempting rotation...")
-
-            # Try next available key/provider
-            next_pair = self._rotation_manager.get_available()
-            if next_pair and next_pair[0] is not provider:
-                next_provider, next_cb = next_pair
-                try:
-                    res2 = await asyncio.wait_for(next_provider.complete_json(prompt), timeout=timeout)
-                    if res2:
-                        self._rotation_manager.mark_success(next_cb)
-                        return res2
-                except Exception as e2:
-                    self._rotation_manager.mark_failure(next_cb, is_quota=_is_quota_error(e2))
-                    logger.error(f"Fallback provider complete_json also failed: {e2}")
+                return result
+            except Exception as error:
+                is_quota = _is_quota_error(error)
+                self._rotation_manager.mark_failure(cb, is_quota=is_quota)
+                logger.warning(
+                    "Provider %s failed on JSON attempt %s; rotating immediately: %s",
+                    provider.provider_name, attempted, error,
+                )
 
         return {}
 

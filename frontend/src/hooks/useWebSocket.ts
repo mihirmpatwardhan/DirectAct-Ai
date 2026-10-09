@@ -20,8 +20,9 @@ const WS_URL = (sessionId: string): string => {
   return `${proto}://${location.host}/ws/${sessionId}${tokenParam}`;
 };
 
-const BASE_RECONNECT_MS = 3000;
+const BASE_RECONNECT_MS = 2000;
 const MAX_RECONNECT_MS = 30000;
+const HEARTBEAT_MS = 45000;
 
 export function useWebSocket(sessionId: string | null) {
   // ── Stable refs (never re-ordered, always the same number of hooks) ─────────
@@ -241,7 +242,7 @@ export function useWebSocket(sessionId: string | null) {
       if (wsRef.current?.readyState === WebSocket.OPEN) {
         wsRef.current.send(JSON.stringify({ type: 'ping' }));
       }
-    }, 25000);
+    }, HEARTBEAT_MS);
 
     return () => {
       destroyed = true;

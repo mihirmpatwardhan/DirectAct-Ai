@@ -154,6 +154,10 @@ async function cdp(tabId, method, params = {}) {
 chrome.debugger.onEvent.addListener(async (source, method) => {
   if (method === 'Page.javascriptDialogOpening') {
     try {
+      // Never handle a dialog belonging to a normal user tab.  The bridge may
+      // be attached to more than one tab across a worker restart, but only its
+      // explicitly owned background tab is automation scope.
+      if (!source?.tabId || !(await isOwnedAutomationTab(source.tabId))) return;
       await chrome.debugger.sendCommand(source, 'Page.handleJavaScriptDialog', { accept: true });
     } catch (_) {}
   }
@@ -414,10 +418,10 @@ async function interact(tab, payload) {
   try {
     const match = await evaluate(tab.id, interactionExpression(payload.target, true));
     if (match && Number.isFinite(match.x) && Number.isFinite(match.y)) {
-      try {
-        await dispatchMouseClick(tab.id, match.x, match.y);
-      } catch (_) {}
-      return { clicked: true, text: match.text, mechanism: 'hybrid' };
+      // interactionExpression already dispatches the browser event sequence
+      // and calls element.click().  A second CDP mouse click can submit a form
+      // twice or click through a modal while it is disappearing.
+      return { clicked: true, text: match.text, mechanism: 'dom' };
     }
   } catch (_) {}
 

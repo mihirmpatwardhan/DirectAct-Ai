@@ -485,7 +485,8 @@ Write-Output '{save_path_ps}'
         from app.core.websocket_manager import manager
 
         t0 = datetime.utcnow()
-        max_steps = 15
+        cfg_max = getattr(settings, "max_agent_steps", 100)
+        max_steps = 1000 if cfg_max <= 0 else cfg_max
         history: list[str] = []
 
         for step in range(1, max_steps + 1):

@@ -104,12 +104,15 @@ async def websocket_endpoint(
                     # Preserve greeting history ordering, but never drop an
                     # early message sent by the local app during connect.
                     await greeting_task
-                    await _handle_chat_message(
+                    # FIX: run as background task so the receive loop keeps
+                    # responding to pings while the agent is executing.
+                    # Without this the browser disconnects after ~25s (heartbeat timeout).
+                    asyncio.create_task(_handle_chat_message(
                         session_id=session_id,
                         user_content=payload.get("content", ""),
                         target_engine=payload.get("target_engine"),
                         user_id=user_id,
-                    )
+                    ))
 
                 elif event_type == "approval_response":
                     action_id = payload.get("action_id")
@@ -160,7 +163,7 @@ GREETING_MESSAGES = [
     "👋 **Hey there! I'm DirectAct-AI** — your AI copilot for web & desktop automation.\n\n"
     "I can help you with:\n"
     "- 🖥️ **Launch apps** — *\"Open Notepad and write a task list\"*\n"
-    "- 🌐 **Browse the web** — *\"Go to YouTube and search for Python tutorials\"*\n"
+    "- 🌐 **Browse the web** — *\"Search the web for Python tutorials\"*\n"
     "- 📁 **Manage files** — *\"Create a folder called Projects on the Desktop\"*\n"
     "- 💬 **Answer anything** — Ask me any question, I'm not just an automation bot!\n\n"
     "What would you like to do today? 🚀",

@@ -165,4 +165,18 @@ Write-Host 'Top bar mein Live dikhna chahiye (WebSocket connected).' -Foreground
 Write-Host 'Agar Offline dikhe to backend terminal check karo.' -ForegroundColor Yellow
 Write-Host ''
 
-Start-Process 'http://127.0.0.1:5173/signup'
+$targetUrl = 'http://127.0.0.1:5173/dashboard'
+$chromeCandidates = @(
+    'C:\Program Files\Google\Chrome\Application\chrome.exe',
+    'C:\Program Files (x86)\Google\Chrome\Application\chrome.exe',
+    "$env:LOCALAPPDATA\Google\Chrome\Application\chrome.exe"
+)
+$chromeBin = $chromeCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+
+if ($chromeBin) {
+    Write-Host "Opening in Google Chrome: $targetUrl" -ForegroundColor Cyan
+    Start-Process -FilePath $chromeBin -ArgumentList $targetUrl
+} else {
+    Write-Host "Opening in default browser: $targetUrl" -ForegroundColor Cyan
+    Start-Process $targetUrl
+}

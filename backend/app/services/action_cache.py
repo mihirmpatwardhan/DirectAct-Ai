@@ -62,7 +62,7 @@ class ActionSequenceCache:
     def _normalize_intent(self, intent: str) -> str:
         """
         Normalize an intent string to a stable cache key.
-        Handles minor variations: 'open youtube' == 'launch youtube' == 'go to youtube'
+        Handles minor variations of an otherwise identical requested action.
         """
         lower = intent.strip().lower()
 
